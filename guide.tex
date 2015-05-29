@@ -1,0 +1,459 @@
+\documentclass{article}
+
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+
+\lstdefinelanguage{Rust}%
+  {
+   morekeywords={abstract,alignof,as,become,box,%
+                 break,const,continue,crate,do,%
+                 else,enum,extern,false,final,%
+                 fn,for,if,impl,in,%
+                 let,loop,macro,match,mod,%
+                 move,mut,offsetof,override,priv,%
+                 proc,pub,pure,ref,return,%
+                 Self,self,sizeof,static,struct,%
+                 super,trait,true,type,typeof,%
+                 unsafe,unsized,use,virtual,where,%
+                 while,yield},%
+     sensitive,%
+   moredelim=[s][keywordstyle3]{::}{::},%
+   morecomment=[s]{/*}{*/},%
+   morecomment=[l]//,%
+   morestring=[b]",%
+   morestring=[b]',%
+  }[keywords,comments,strings]
+
+\definecolor{comment}{rgb}{0,0.6,0}
+\definecolor{string}{rgb}{0.58,0,0.82}
+
+\lstset{ %
+  basicstyle=\footnotesize,
+  columns=fixed,
+  breakatwhitespace=false,
+  breaklines=true,
+  captionpos=b,
+  commentstyle=\color{comment},
+  frame=single
+  keepspaces=true,
+  keywordstyle=\color{blue},
+  language=Rust,
+  numbers=none,
+  stringstyle=\color{string},
+  tabsize=4,
+}
+
+\title{Playstation Emulation Guide}
+\date{\today}
+\author{simias}
+
+\begin{document}
+
+\maketitle
+\newpage
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+This is my attempt at documenting my implementation of a PlayStation
+emulator from scratch. I'll write the document as I go and I'll try to
+explain as much as possible along the way.
+
+Since my favourite passtime is to reinvent the wheel and recode things
+that already exist I decided that this time I might as well document
+it. This way maybe this time something useful will come out of it and
+it'll give me a motivation to finish it.
+
+I will be using the Rust programming language but this is not meant as
+a Rust tutorial and knowledge of the language shouldn't be necessary
+to follow this guide, although it won't hurt.
+
+\subsection{Isn't emulation complicated?}
+
+Emulation requires some low-level knowledge about how computers work
+and some basics in electronics might help for certain things. Since
+this doc is meant as an introduction to emulation I'll assume that the
+reader doesn't bring anything with them beyond some decent programming
+skills. So don't worry if you're not familiar with registers, cache,
+memory mapped IO, virtual memory, interrupts and other low level fun:
+I'll try to explain everything when needed. Emulators are a good
+introduction to low level programming without having to bother with
+that pesky hardware in person!
+
+Since this is supposed to be a general guide about writing PlayStation
+emulators I won't put the entire source code of the emulator here,
+only snippets relevant to the matter beind discussed. The code will
+live in an other repository and I'll just reference individual commits
+when implementing certain features so that you can see the entire code
+in context if you want.
+
+Finally, keep in mind that getting a PlayStation emulator even capable
+to run \emph{some} games decently will require quite a lot of work. Don't
+expect to play Final Fantasy VII on your brand new emulator in two
+days. If you want to start with something simpler to see if you have a
+taste for it you can search for Chip-8, Game Boy or NES emulation
+tutorials (by increasing complexity).
+
+\subsection{Feedback}
+
+If some part of this document is unclear, poorly written or incomplete
+please submit an issue so that I can fix or complete it. Corrections
+for grammar, syntax and typos are very welcome. Thank you!
+
+Ready? Let's begin!
+
+
+\section{The CPU and the memory}
+
+\subsection{What is a CPU, anyway?}
+
+That might seem like a silly question to some but I'm sure there are
+plenty of competent programmers out there who are used to program in
+high level managed environements haven't seen a register in their
+entire life. So let me make the introductions.
+
+For our first version of the PlayStation CPU I'm going to make some
+simplifying assumptions. I'm going to ignore the caches for instance
+and assume that it directly accesses the system bus. Basically we're
+going to implement a
+\href{https://en.wikipedia.org/wiki/Von_Neumann_architecture}{Von
+ Neumann architecture}.As we make progress we'll have to revisit this
+design to add the missing bits when they are needed.
+
+The objective of this section is to implement all the instructions and
+try to reach the part of the BIOS where it starts to draw on the
+screen. As we'll see there's a bunch of boring initialization code to
+run before we get there.
+
+There are 67 opcodes in the Playstation MIPS CPU. Some take one line
+to implement, others will give us more trouble. In order to make the
+process more interactive and less tedious we'll implement them as
+they're encountered while we're running the original BIOS code. This
+way we'll immediately be able to see our emulator in action.
+
+But first things first, before we start implementing instructions we
+need to explain how a CPU works.
+
+\subsection{Architecture}
+
+A simple Von Neumann architecture looks like this: the CPU only sees a
+flat address space: an array of bytes. The PlayStation uses 32bit
+addresses so the CPU sees \texttt{1 << 32} addresses which means it
+can address 4GB of memory. That's why the PlayStation is said to be a
+32bit console (that and the fact that it uses 32bit registers in the
+CPU as we'll see in a minute).
+
+This address space contains all the external ressources the CPU can
+access: the RAM of course but also the various peripherals (GPU,
+controllers, CD drive, BIOS...). That's called
+\href{https://en.wikipedia.org/wiki/Memory-mapped_I/O}{memory mapped
+  IO}. Note that in this context "memory" doesn't mean RAM. Rather it
+means that you access peripherals as if they were memory (instead of
+using dedicated instructions for instance). From the point of view of
+the CPU, everything is just a big array of bytes and it doesn't really
+know what's out there.
+
+Of course we'll have to figure out how the devices and RAM are mapped
+in this address space to make sure the transactions end up at the
+right location when the CPU starts reading and writing to the bus. But
+first we need to understand how the code is executed.
+
+\subsection{The code}
+
+In this architecture the instructions live in the global address space
+along with everything else. Typically in RAM but again, the CPU
+doesn't care. If you want to run code from the controller input port
+I'm sure the console will let you. Probably not very useful but it's
+all the same as far as the CPU is concerned.
+
+So somewhere in this 4GB address space there's the next instruction
+for the CPU to run. How does it know the address of this instruction?
+By using a register of course!
+
+\subsection{The Program Counter register}
+
+\href{https://en.wikipedia.org/wiki/Processor_register}{Registers} are
+very small and very fast special purpose memories built inside the
+CPU. Most CPU instructions manipulate those registers by adding them,
+multiplying them, masking them, storing their content to memory or
+fetching it back\ldots{}
+
+\href{https://en.wikipedia.org/wiki/Program_counter}{The Program
+  Counter} (henceforth refered to as \texttt{PC}) is one of the most
+elementary registers, it exists in one form or an other on basically
+all computer architectures (although it goes by various names, on x86
+for instance it's called the Instruction Pointer, \texttt{IP}). Its
+job is simply to hold the address of the next instruction to be run.
+
+As we've seen, the PlayStation uses 32bit addresses, so the PC
+register is 32bit wide (as are all other CPU registers for that
+matter).
+
+So a typical CPU execution cycle goes roughly like this:
+
+\begin{enumerate}
+  \item Fetch the instruction located at address \texttt{PC},
+  \item Increment the \texttt{PC} to point to the next instruction,
+  \item Execute the instruction,
+  \item Repeat
+\end{enumerate}
+
+We need to know how big an instruction is in order to know how many
+bytes to fetch and how much we need to increment the \texttt{PC} to
+point at the next instruction. Some architectures have variable length
+instructions (x86 and derivatives are a common example) which means
+we'd have to decode the instruction to know how many bytes it
+takes. Fortunately for us, the PlayStation uses a fixed length
+instruction set
+(\href{https://en.wikipedia.org/wiki/MIPS_instruction_set}{The MIPS
+  instruction set}) and all instructions are 32bit long.
+
+With all that in mind we can finally start writing some code!
+
+Here's what the CPU state looks like at that point:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    /// The program counter register
+    pc: u32,
+}
+\end{lstlisting}
+
+And here's the implementation of our CPU cycle described above:
+
+\begin{lstlisting}
+impl Cpu {
+
+    pub fn run_next_instruction(&mut self) {
+        let pc = self.pc;
+
+        // Fetch instruction at PC
+        let instruction = self.load32(pc);
+
+        // Increment PC to point to the next instruction.
+        self.pc = pc.wrapping_add(4);
+
+        self.decode_and_execute(instruction);
+    }
+}
+\end{lstlisting}
+
+In Rust \texttt{wrapping\_add} means that we want the \texttt{PC} to
+wrap back to 0 in case of an overflow (i.e. \texttt{0xfffffffc + 4 =>
+0x00000000}). We'll see that most CPU operations wrap on overflow
+(although some instructions catch those overflows and generate an
+exception, we'll see that later). The \texttt{PC} is no exception.
+
+If you're coding in C you don't need to worry about that if you use
+\texttt{uint32\_t} since the C standard mandates that unsigned overflow wraps
+around in this fashion. Rust however says that overflows are undefined
+and will generate an error in debug builds if an unchecked overflow is
+detected, that's why I need to write \texttt{pc.wrapping\_add(4)} instead of
+\texttt{pc + 4}.
+
+We now finally have some code but it doesn't build yet.
+
+We're still missing 3 pieces of the puzzle before we can run this
+piece of code:
+
+\begin{itemize}
+ \item What's the initial value of \texttt{PC} when starting up?
+ \item How do we implement the \texttt{fetch32} function?
+ \item How do we implement the \texttt{decode\_and\_execute} function?
+\end{itemize}
+
+\subsubsection{Reset value of the \texttt{PC}}
+
+In integrated circuits
+\href{https://en.wikipedia.org/wiki/Reset_%28computing%29}{reset} is a
+state where the chip generally does nothing and its internal state
+is set to some known default ``factory'' value. What exactly the
+reset does varies from chip to chip (it's just a convention) but
+it's assumed that a chip will restart in a clean and deterministic
+state after a reset cycle.
+
+Generally the reset is a dedicated pin on the chip that's connected to
+a button or some other control logic. Sometimes you can also request a
+"soft" reset through software using a specific command or sequence of
+instructions. Reseting a chip does necessitate cutting off the power
+(nor is power cycling an integrated circuit a good way to reset a
+chip: if the reset signal is not asserted it might not load the
+default values correctly).
+
+When you power up the console or hit the reset button the hardware
+forces the CPU (and other peripherals) into a reset state to
+initialize the logic.
+
+Knowing this it's pretty obvious that the reset value of the
+\texttt{PC} is very important since it's going to tell the CPU where
+it should start running the code. It basically defines the location of
+the "main" function of the console's kernel.
+
+The docs say that the reset value of \texttt{PC} is
+\texttt{0xbfc00000}. In the playstation memory map that's the
+beginning of the BIOS (we'll look at the memory map in greater details
+in the next section).
+
+Now that we know where our story starts we can write our CPU
+initializer:
+
+\begin{lstlisting}
+impl Cpu {
+
+    pub fn new() -> Cpu {
+     	Cpu {
+            // PC reset value at the beginning of the BIOS
+            pc: 0xbfc00000,
+        }
+    }
+
+    //...
+}
+\end{lstlisting}
+
+\subsection{The Playstation memory map}
+
+Our CPU treats all addresses the same way but at some point we'll have
+to dispatch the load/store requests to the correct peripheral. If we
+read the BIOS and we get GPU data instead we're going to run into
+troubles very quickly\ldots{}
+
+So how do we know what is mapped at some arbitrary address? By using
+the \href{https://en.wikipedia.org/wiki/Memory_map}{memory map} of
+course!
+
+Here's an overview of the PlayStation memory map, courtesy of
+\href{http://problemkaputt.de/psx-spx.htm#cpuspecifications}{the Nocash
+  specs}:
+
+\begin{table}[ht]
+  \centering
+
+  \begin{tabular}{ l | l | l | r | l }
+    KUSEG & KSEG0 & KSEG1 & Length & Description \\
+    \hline
+    \texttt{0x00000000} & \texttt{0x80000000} & \texttt{0xa0000000} & 2048K
+     & Main RAM \\
+    \texttt{0x1f000000} & \texttt{0x9f000000} & \texttt{0xbf000000} & 8192K
+     & Expansion Region 1 \\
+    \texttt{0x1f800000} & \texttt{0x9f800000} & \texttt{0xbf800000} &    1K
+     & Scratchpad \\
+    \texttt{0x1f801000} & \texttt{0x9f801000} & \texttt{0xbf801000} &    8K
+     & Hardware registers \\
+    \texttt{0x1fc00000} & \texttt{0x9fc00000} & \texttt{0xbfc00000} &  512K
+     & BIOS ROM \\
+  \end{tabular}
+
+  \caption{Playstation memory map}
+  \label{tab:mmap}
+\end{table}
+
+Let's take the time to parse through this.
+
+We can see that most peripherals in table~\ref{tab:mmap} are mapped at
+several addresses. For instance if we look at the \texttt{PC} reset
+value \texttt{0xbfc00000} corresponds to the beginning of the BIOS range in
+region KSEG1. However we can also reach the same location through
+addresses \texttt{0x1fc00000}(KUSEG) and \texttt{0x9fc00000}(KSEG0).
+
+What's the point of having those mirrored regions? What's the
+difference between KUSEG and KSEG1 for instance? Those are memory
+regions which are used to specify certain attributes of the memory
+access. On the Playstation hardware it's mostly used to specify
+whether the access is cached or not.
+
+For now we're going to ignore regions and treat all mappings the same,
+we'll study them more closely later on.
+
+\begin{table}[ht]
+  \centering
+
+  \begin{tabular}{ l | r | l }
+    KSEG2 & Length & Description \\
+    \hline
+    \texttt{0xfffe0000} & 512B & I/O Ports \\
+  \end{tabular}
+
+  \caption{KSEG2 memory map}
+  \label{tab:kseg2}
+\end{table}
+
+Table~\ref{tab:kseg2} shows the last region: KSEG2. It's a bit
+different from the others. It doesn't mirror the other regions,
+instead it gives access to a unique set of registers. As far as I know
+the only important register there is the cache control but there might
+be others I haven't encountered yet.
+
+\subsubsection{Implementing the memory map}
+
+In order to implement the PlayStation memory map in our emulator we
+will need an interconnect to dispatch the load/store operations to the
+correct peripheral.
+
+I don't know if the PlayStation really has a hardware
+interconnect. The CPU could just "broadcast" the read/write operations
+on the system bus and the peripherals would check the address and only
+answer if it's for them. However this design would be inefficient in
+software: we'd need to iterate over the peripherals for each
+transaction until we find the correct receiver.
+
+Instead we're just going to implement a "switchboard" that will match
+the address to the correct peripheral and forward it there.
+
+Since the first thing the emulator will run is the BIOS we'll use it
+as our first peripheral.
+
+\subsection{The BIOS}
+
+On the PlayStation the BIOS displays the first screens (with the logos
+and that memorable sweeping tune) and starts the game from the CD
+drive. If no CD is present it displays a menu that can be used to
+manage the memory cards and play CDs. As a player that's probably the
+only time you'd know there was a BIOS running.
+
+But that's just the tip of the iceberg! The BIOS remains loaded at all
+time and provides a Basic Input/Output System to the running
+game. That means that the game can call into the BIOS to do things
+like allocating memory, reading the memory card, common libc functions
+(qsort, memset...) and many other things.
+
+We won't be implementing the BIOS ourselves. It's possible (and it's
+been done) but that's a lot of work and probably something you'd want
+to do once you have a working emulator. It might also hurt
+compatibility since many games are known to patch the BIOS at
+runtime. The
+\href{http://problemkaputt.de/psx-spx.htm#biospatches}{Nocash specs}
+have more info.
+
+We could dump the BIOS of a console but that requires access to the
+actual hardware and the know-how to access the BIOS
+memory. Fortunately some nice people have done it for us and these
+days it's easy to find BIOS files on the web.
+
+There are many BIOS versions: they change depending on the region, the
+hardware revision and patches. Any good dump should work (after all,
+they all do more or less the same thing) but if you're following this
+guide it's probably better that we use the same file.
+
+\begin{table}[ht]
+  \centering
+
+  \begin{tabular}{ l | l }
+    Algorithm & Hash \\
+    \hline
+    MD5    & \texttt{924e392ed05558ffdb115408c263dccf} \\
+    SHA1   & \texttt{10155d8d6e6e832d6ea66db9bc098321fb5e8ebf} \\
+  \end{tabular}
+
+  \caption{\texttt{SCPH1001.BIN} BIOS checksums}
+  \label{tab:checksums}
+\end{table}
+
+I've decided to go for the version named \texttt{SCPH1001.BIN}. The file
+should be *exactly* 512KB big. Check table~\ref{tab:checksums} to make
+sure you got the right one.
+
+\end{document}
