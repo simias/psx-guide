@@ -456,4 +456,317 @@ I've decided to go for the version named \texttt{SCPH1001.BIN}. The file
 should be *exactly* 512KB big. Check table~\ref{tab:checksums} to make
 sure you got the right one.
 
+\subsection{Loading the BIOS}
+
+Once we got our BIOS the rest is pretty straightforward. We just read
+the file into a 512KB buffer:
+
+\begin{lstlisting}
+/// BIOS image
+pub struct Bios {
+    /// BIOS memory
+    data: Vec<u8>
+}
+
+impl Bios {
+
+    /// Load a BIOS image from the file located at `path`
+    pub fn new(path: &Path) -> Result<Bios> {
+
+        let file = try!(File::open(path));
+
+        let mut data = Vec::new();
+
+        // Load the BIOS
+        try!(file.take(BIOS_SIZE).read_to_end(&mut data));
+
+        if data.len() == BIOS_SIZE as usize {
+            Ok(Bios { data: data })
+        } else {
+            Err(Error::new(ErrorKind::InvalidInput,
+                           "Invalid BIOS size"))
+        }
+    }
+}
+
+/// BIOS images are always 512KB in length
+const BIOS_SIZE: u64 = 512 * 1024;
+\end{lstlisting}
+
+We also need to be able to read data from the BIOS. The CPU wants to
+read 32bit of data to load the instructions so let's start by
+implementing load32:
+
+\begin{lstlisting}
+impl Bios {
+    // ...
+
+    /// Fetch the 32bit little endian word at `offset`
+    pub fn load32(&self, offset: u32) -> u32 {
+        let offset = offset as usize;
+
+        let b0 = self.data[offset + 0] as u32;
+        let b1 = self.data[offset + 1] as u32;
+        let b2 = self.data[offset + 2] as u32;
+        let b3 = self.data[offset + 3] as u32;
+
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+}
+\end{lstlisting}
+
+A few things to note: \texttt{offset}, as its name implies, is not the
+absolute address used by the CPU, it's just the offset in the BIOS
+memory range. Remember that the BIOS is mapped in multiple regions so
+we'll handle that in the generic interconnect code. Each peripheral
+will just handle offsets in its address range.
+
+In the comment I mention that we read the word in \emph{little
+  endian}. That's important. If you've never had to worry about
+\href{https://en.wikipedia.org/wiki/Endianness}{endianess} issues
+before let me give you the gist.
+
+The basic unit of memory is a byte (8 bits in our case). You cannot
+address anything smaller than that. However sometimes you need to
+store data over multiple bytes. For instance we've seen that our
+instructions are 4byte long. We have multiple way to store 4byte words
+in our "array of bytes".
+
+Let's take an example: you have the 32bit word
+\texttt{0x12345678}. You have multiple way to store that value in 4
+consecutive bytes. We can store [0x12, 0x34, 0x56, 0x78] or
+[0x78, 0x56, 0x34, 0x12] for instance. The former is called
+\emph{big-endian} because we store the most significant byte
+first. The latter is \emph{little-endian} because we store the least
+significant byte first. There are other endian types with weirder
+patterns but they're not often used is modern computers. Check
+wikipedia if you want more details.
+
+The PlayStation is little-endian so we're in the 2nd case: when
+reading or writing multi-byte values the least significiant byte goes
+first. If we do it the other way around we'll end up with garbage.
+
+Now we can implement our interconnect to let the CPU communicate with
+the BIOS.
+
+\subsection{The interconnect}
+
+We now have an embryo of a CPU and our first device ready to talk to
+each other. We just need to figure out how to link them together.
+
+At that point we could have the CPU talk directly to the BIOS, after
+all it's our only device. Obviously that won't work for very long
+however, we need to be able to dispatch the CPU's loads and stores to
+the correct peripheral depending on the address range.
+
+I'm not quite sure how this is handled on the actual hardware. For
+simple buses it's very possible that the CPU just "broadcasts" the
+address to all the peripherals and each of them just checks if it's
+within their address range and simply ignores the transaction if they
+see it's not for them. It's fast in hardware because all peripherals
+work in parallel so there's no delay induced: they can all receive and
+decode the address at the same moment.
+
+Unfortunately we can't really do that in software: the closest
+equivalent would be to spawn a thread for each peripheral. The problem
+is that memory transactions are very common (several millions per
+second potentially) and having to send data and resynchronize across
+threads would kill our performances.
+
+Multihreading emulators in general is a very tough issue: for
+threading to be really efficient you need to reduce data exchange and
+resynchronization as much as possible to let each thread live its
+life. When we emulate however we want to mimick the original hardware
+behaviour and speed as much as possible which requires very frequent
+resynchronization and we have plenty of shared state. The two
+endeavors are somewhat at odds. That's not to say multithreading is
+impossible in emulators, just that it's hard. We can't just spawn
+threads willy-nilly.
+
+Anyway, back to our interconnect: since threads are out it means we'll
+have to sequentially match the address against each mapping until we
+get a match. Then we can let the selected peripheral handle the
+transaction.
+
+Let's do just that:
+
+\begin{lstlisting}
+/// Global interconnect
+pub struct Interconnect {
+    /// Basic Input/Output memory
+    bios: Bios,
+}
+
+impl Interconnect {
+    pub fn new(bios: Bios) -> Interconnect {
+        Interconnect {
+            bios: bios,
+        }
+    }
+}
+\end{lstlisting}
+
+I've decided to store the BIOS directly in the interconnect
+\texttt{struct}. We'll append the other peripherals there as we
+implement them. We are going to store the interconnect inside the
+\texttt{struct Cpu} which will give us a device tree with the CPU at
+the top. It makes the data paths pretty simple: everything goes \emph{from}
+the CPU \emph{to} the peripherals. It's easier to reason about than a full
+``everybody sees everybody'' architecture in my opinion but it might
+prove limiting as we progress. We'll see if we need to revise that
+later.
+
+Now we can finally implement the \texttt{load32} function that the CPU
+will be using. I don't like having hardcoded constants all over the
+place so I'm going to tie the address ranges to nice symbolic names:
+
+\begin{lstlisting}
+mod map {
+    struct Range(u32, u32);
+
+    impl Range {
+        /// Return `Some(offset)` if addr is contained in `self`
+        pub fn contains(self, addr: u32) -> Option<u32> {
+            let Range(start, length) = self;
+
+            if addr >= start && addr < start + length {
+                Some(addr - start)
+            } else {
+                None
+            }
+        }
+    }
+
+    pub const BIOS: Range = Range(0xbfc00000, 512 * 1024);
+}
+\end{lstlisting}
+
+If you're not familiar with rust what this does is create a new type
+\texttt{Range} which is a tuple of two values: the start address and length
+of the mapping.
+
+I also declare a \texttt{contains} methods which takes an address and
+returns \texttt{Some(offset)} if the address is within the range,
+\texttt{None} otherwise. You can think of it as a form of multiple
+return values with some nice type-safety on top.
+
+Finally I declare our first range for the BIOS.
+
+Now for the load32 function:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 32bit word at `addr`
+    pub fn load32(&self, addr: u32) -> u32 {
+
+        if let Some(offset) = map::BIOS.contains(addr) {
+            return self.bios.load32(offset);
+        }
+
+        panic!("unhandled fetch32 at address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+The \texttt{if let} syntax is an other rust nicety: if the
+\texttt{contains} function returns \texttt{Some(offset)} we enter the
+body of the if with \texttt{offset} bound to a temporary variable. If
+\texttt{contains} returns \texttt{None} on the other hand the
+\texttt{if} is refuted and we don't enter the body and go straight to
+the \texttt{panic!} command which will make our emulator crash.
+
+\subsection{Gluing the interconnect to the CPU}
+
+The only thing left before we can finally build our code is gluing the
+Interconnect with the Cpu.
+
+We add an \texttt{inter} member to the \texttt{struct Cpu} and take an
+\texttt{Interconnect} object in the constructor:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    /// The program counter register
+    pc: u32,
+    /// Memory interface
+    inter: Interconnect,
+}
+
+impl Cpu {
+
+    pub fn new(inter: Interconnect) -> Cpu {
+        Cpu {
+            // PC reset value at the beginning of the BIOS
+            pc: 0xbfc00000,
+            inter: inter,
+        }
+    }
+
+    // ...
+}
+\end{lstlisting}
+
+We can also implement the `load32` function for the CPU which will
+just call the interconnect.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load 32bit value from the interconnect
+    fn load32(&self, addr: u32) -> u32 {
+        self.inter.load32(addr)
+    }
+}
+\end{lstlisting}
+
+We're still lacking the \texttt{decode\_and\_execute} function, let's use a
+placeholder function that just panics for now:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    fn decode_and_execute(&mut self, instruction: u32) {
+        panic!("Unhandled instruction {:08x}", instruction);
+    }
+}
+\end{lstlisting}
+
+Finally we can instantiate everything in our `main` function:
+
+\begin{lstlisting}
+fn main() {
+    let bios = Bios::new(&Path::new("roms/SCPH1001.BIN")).unwrap();
+
+    let inter = Interconnect::new(bios);
+
+    let mut cpu = Cpu::new(inter);
+
+    loop {
+        cpu.run_next_instruction();
+    }
+}
+\end{lstlisting}
+
+I've hardcoded the BIOS path for now. It would be better to read it
+from the command line, a config file or even some fancy dialog window
+but it'll do nicely for now.
+
+We should now be able to build the code. When I run it, assuming that
+the BIOS file was found at the correct location I get:
+
+\begin{verbatim}
+thread `<main>' panicked at 'Unhandled instruction 3c080013'
+\end{verbatim}
+
+As expected the \texttt{decode\_and\_execute} function died on us but
+we managed to fetch an instruction. If you've been using the same BIOS
+file as me you should have exactly the same value of
+\texttt{0x3c080013}. If you got an other value something is wrong with
+your code. In particular if you end up with \texttt{0x1300083c} it
+means you're erroneously reading in big-endian.
+
 \end{document}
