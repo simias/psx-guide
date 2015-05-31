@@ -1,4 +1,4 @@
-\documentclass{article}
+\documentclass[a4paper]{article}
 
 \usepackage{hyperref}
 \usepackage{listings}
@@ -17,10 +17,23 @@
                  super,trait,true,type,typeof,%
                  unsafe,unsized,use,virtual,where,%
                  while,yield},%
-     sensitive,%
+   sensitive,%
+   morekeywords=[1]{\$},%
    moredelim=[s][keywordstyle3]{::}{::},%
    morecomment=[s]{/*}{*/},%
    morecomment=[l]//,%
+   morestring=[b]",%
+   morestring=[b]',%
+  }[keywords,comments,strings]
+
+\lstdefinelanguage{assembly}%
+  {
+   morekeywords={nop,lui,move,addu,addiu,jal,sll,%
+                 sw,sh,sb,%
+                 },%
+   sensitive,%
+   moredelim=[s]{::}{::},%
+   morecomment=[s]{/*}{*/},%
    morestring=[b]",%
    morestring=[b]',%
   }[keywords,comments,strings]
@@ -44,9 +57,16 @@
   tabsize=4,
 }
 
+\newcommand{\commit}[1] {%
+  \medskip
+  \framebox{You can get the current version of the emulator in
+    \href{https://github.com/simias/psx-rs/commit/#1}{commit
+      \texttt{#1}}}
+  \medskip}
+
 \title{Playstation Emulation Guide}
 \date{\today}
-\author{simias}
+\author{Lionel Flandrin}
 
 \begin{document}
 
@@ -103,7 +123,6 @@ please submit an issue so that I can fix or complete it. Corrections
 for grammar, syntax and typos are very welcome. Thank you!
 
 Ready? Let's begin!
-
 
 \section{The CPU and the memory}
 
@@ -181,10 +200,10 @@ multiplying them, masking them, storing their content to memory or
 fetching it back\ldots{}
 
 \href{https://en.wikipedia.org/wiki/Program_counter}{The Program
-  Counter} (henceforth refered to as \texttt{PC}) is one of the most
+  Counter} (henceforth refered to as PC) is one of the most
 elementary registers, it exists in one form or an other on basically
 all computer architectures (although it goes by various names, on x86
-for instance it's called the Instruction Pointer, \texttt{IP}). Its
+for instance it's called the Instruction Pointer, IP). Its
 job is simply to hold the address of the next instruction to be run.
 
 As we've seen, the PlayStation uses 32bit addresses, so the PC
@@ -194,14 +213,14 @@ matter).
 So a typical CPU execution cycle goes roughly like this:
 
 \begin{enumerate}
-  \item Fetch the instruction located at address \texttt{PC},
-  \item Increment the \texttt{PC} to point to the next instruction,
+  \item Fetch the instruction located at address PC,
+  \item Increment the PC to point to the next instruction,
   \item Execute the instruction,
   \item Repeat
 \end{enumerate}
 
 We need to know how big an instruction is in order to know how many
-bytes to fetch and how much we need to increment the \texttt{PC} to
+bytes to fetch and how much we need to increment the PC to
 point at the next instruction. Some architectures have variable length
 instructions (x86 and derivatives are a common example) which means
 we'd have to decode the instruction to know how many bytes it
@@ -241,11 +260,11 @@ impl Cpu {
 }
 \end{lstlisting}
 
-In Rust \texttt{wrapping\_add} means that we want the \texttt{PC} to
+In Rust \texttt{wrapping\_add} means that we want the PC to
 wrap back to 0 in case of an overflow (i.e. \texttt{0xfffffffc + 4 =>
 0x00000000}). We'll see that most CPU operations wrap on overflow
 (although some instructions catch those overflows and generate an
-exception, we'll see that later). The \texttt{PC} is no exception.
+exception, we'll see that later). The PC is no exception.
 
 If you're coding in C you don't need to worry about that if you use
 \texttt{uint32\_t} since the C standard mandates that unsigned overflow wraps
@@ -260,12 +279,12 @@ We're still missing 3 pieces of the puzzle before we can run this
 piece of code:
 
 \begin{itemize}
- \item What's the initial value of \texttt{PC} when starting up?
+ \item What's the initial value of PC when starting up?
  \item How do we implement the \texttt{fetch32} function?
  \item How do we implement the \texttt{decode\_and\_execute} function?
 \end{itemize}
 
-\subsubsection{Reset value of the \texttt{PC}}
+\subsubsection{Reset value of the PC}
 
 In integrated circuits
 \href{https://en.wikipedia.org/wiki/Reset_%28computing%29}{reset} is a
@@ -288,11 +307,11 @@ forces the CPU (and other peripherals) into a reset state to
 initialize the logic.
 
 Knowing this it's pretty obvious that the reset value of the
-\texttt{PC} is very important since it's going to tell the CPU where
+PC is very important since it's going to tell the CPU where
 it should start running the code. It basically defines the location of
 the "main" function of the console's kernel.
 
-The docs say that the reset value of \texttt{PC} is
+The docs say that the reset value of PC is
 \texttt{0xbfc00000}. In the playstation memory map that's the
 beginning of the BIOS (we'll look at the memory map in greater details
 in the next section).
@@ -354,7 +373,7 @@ Here's an overview of the PlayStation memory map, courtesy of
 Let's take the time to parse through this.
 
 We can see that most peripherals in table~\ref{tab:mmap} are mapped at
-several addresses. For instance if we look at the \texttt{PC} reset
+several addresses. For instance if we look at the PC reset
 value \texttt{0xbfc00000} corresponds to the beginning of the BIOS range in
 region KSEG1. However we can also reach the same location through
 addresses \texttt{0x1fc00000}(KUSEG) and \texttt{0x9fc00000}(KSEG0).
@@ -730,7 +749,8 @@ impl Cpu {
     //...
 
     fn decode_and_execute(&mut self, instruction: u32) {
-        panic!("Unhandled instruction {:08x}", instruction);
+        panic!("Unhandled instruction {:08x}",
+               instruction);
     }
 }
 \end{lstlisting}
@@ -768,5 +788,873 @@ file as me you should have exactly the same value of
 \texttt{0x3c080013}. If you got an other value something is wrong with
 your code. In particular if you end up with \texttt{0x1300083c} it
 means you're erroneously reading in big-endian.
+
+\subsection{Instruction decoding}
+
+We've now fetched our first instruction from the BIOS:
+\texttt{0x3c080013}. What do we do with this?
+
+In order to be able to run this instruction we need to decode it to
+figure out what it means. Instruction encoding is of course CPU
+dependent so we need to interpret this value in the context of the
+Playstation \href{https://en.wikipedia.org/wiki/R3000}{R3000}
+processor. Once again the
+\href{http://problemkaputt.de/psx-spx.htm#cpuspecifications}{Nocash
+  specs} have our back and list the format of the
+instruction. \href{https://en.wikipedia.org/wiki/MIPS_instruction_set}{MIPS}
+is a common architecture used outside of the playstation and you can
+find plenty of resources online describing its \href{https://en.wikipedia.org/wiki/Instruction_set}{instruction set}.
+
+Let's decode this one by hand to see how this works. If we look at the
+``Opcode/Parameter Encoding'' table in Nocash's docs we see that we
+need to look at the bits [31:26] of the operation to see what type it
+is. In our case they are \texttt{001111}. That means the operation is
+a \texttt{LUI} or ``Load Upper Immediate''. \emph{Immediate} means
+that the value loaded is directly in the instruction, not indirectly
+somewhere else in memory. \emph{Upper} means that it's loading this
+immediate value into the high 16 bits of the target register. The 16
+low bits are cleared (set to 0).
+
+But what are the register and the value used by the instruction? Well
+we need to finish decoding it to figure it out: for a \texttt{LUI}
+bits [20:16] give us the target register: in our case it's
+\texttt{01000} which means it's register 8. Finally bits [15:0]
+contain the immediate value: \texttt{0000 0000 0001 0011} or 19 in
+decimal. Bits [25:21] are not used and their value doesn't matter.
+
+In other words this instruction puts \texttt{0x13} in the 16 high bits
+of the register 8. In MIPS assembly\footnote{I'm using the GNU
+assembler syntax in this guide} it would be equivalent to:
+
+\begin{lstlisting}[language=assembly]
+lui $8, 0x13
+\end{lstlisting}
+
+Enough babbling, let's implement decoding. First I'll wrap the raw
+instruction in a nice interface that will let us extract the fields
+without doing the bitshifts and masking everywhere. If you look at the
+encoding for other MIPS instructions you'll see that it's fairly
+regular, for instance immediate values are always stored in the LSBs:
+
+\begin{lstlisting}
+struct Instruction(u32);
+
+impl Instruction {
+    /// Return bits [31:26] of the instruction
+    fn function(self) -> u32 {
+        let Instruction(op) = self;
+
+        op >> 26
+    }
+
+    /// Return register index in bits [20:16]
+    fn t(self) -> u32 {
+        let Instruction(op) = self;
+
+        (op >> 16) & 0x1f
+    }
+
+    /// Return immediate value in bits [16:0]
+    fn imm(self) -> u32 {
+        let Instruction(op) = self;
+
+        op & 0xffff
+    }
+}
+\end{lstlisting}
+
+The names for the accessor functions match those I've seen used in the
+various references to name the various fields.
+
+We can now leverage that fancy interface in
+\texttt{decode\_and\_execute}:
+
+\begin{lstlisting}
+impl Cpu {
+     // ...
+
+    fn decode_and_execute(&mut self, instruction: Instruction) {
+        match instruction.function() {
+            0b001111 => self.op_lui(instruction),
+            _        => panic!("Unhandled instruction {:x}", instruction.0),
+        }
+    }
+
+    /// Load Upper Immediate
+    fn op_lui(&mut self, instruction: Instruction) {
+        let i = instruction.imm();
+        let t = instruction.t();
+
+        panic!("what now?");
+    }
+}
+\end{lstlisting}
+
+We're very close to finally run our first instruction in full but
+we're still missing something: we see that the register field in this
+instruction is 5bits, that means it can index 32 registers. But for
+now we only have one register in our CPU: the PC. We need to
+introduce the rest of them.
+
+\subsection{CPU general purpose registers}
+
+\begin{table}[ht]
+  \centering
+
+  \begin{tabular}{ l | l | l }
+    Number      & Name        & Conventional use          \\
+    \hline
+    \$0         & \$zero      & Always zero               \\
+    \$1         & \$at        & Assembler temporary       \\
+    \$2, \$3    & \$v0, \$v1  & Function return values    \\
+    \$4...\$7   & \$a0...\$a3 & Function arguments        \\
+    \$8...\$15  & \$t0...\$t7 & Temporary registers       \\
+    \$16...\$23 & \$s0...\$s7 & Saved registers           \\
+    \$24...\$25 & \$t8...\$t9 & Temporary registers       \\
+    \$26...\$27 & \$k0...\$k1 & Kernel reserved registers \\
+    \$28        & \$gp        & Global pointer            \\
+    \$29        & \$sp        & Stack pointer             \\
+    \$30        & \$fp        & Frame pointer             \\
+    \$31        & \$ra        & Function return address   \\
+  \end{tabular}
+
+  \caption{R3000 CPU general purpose registers}
+  \label{tab:cpuregs}
+\end{table}
+
+Table~\ref{tab:cpuregs} lists the registers in the Playstation MIPS
+R3000 CPU (ignoring the coprocessors for now). They're all 32bit
+wide.
+
+You can see that we have 32 registers (\$0 to \$31) which are the
+\emph{general purpose} registers. They're all given a mnemonic used
+when writing assembly. For instance, by convention, \$29 is the
+\href{https://en.wikipedia.org/wiki/Call_stack}{stack pointer}(\$sp)
+and \$30 holds the
+\href{https://en.wikipedia.org/wiki/Call_stack#FRAME-POINTER}{frame
+  pointer} (\$fp).
+
+It's important to understand that those are just a convention between
+developers, in the hardware there's no difference between \$29` and
+\$30. The point of those
+\href{https://en.wikipedia.org/wiki/Calling_convention}{calling
+  conventions} is to make it possible to make code generated from
+different compilers or written in assembly by different coders remain
+interoperable. If you write MIPS assembly and want to call third party
+functions (like the BIOS functions for instance) you'll have to adhere
+to this convention.
+
+Only two general purpose registers are given a special meaning by the
+hardware itself: \$zero and \$ra.
+
+\subsubsection{The \$zero register}
+
+\$zero (\$0) is \emph{always} equal to 0. If an instruction attempts
+to load a value in this register it doesn't do anything, the register
+will still be 0 afterwards.
+
+Having a constant 0 register is useful to reduce the size of the
+instruction set. For instance if you want to move the value of the
+register \$v0 in \$a0 you can write this:
+
+\begin{lstlisting}[language=assembly]
+move $a0, $v0
+\end{lstlisting}
+
+However this ``move'' instruction is not actually part of the MIPS
+instruction set, it's just a convenient shorthand understood by the
+assembler which will generate the equivalent instruction:
+
+\begin{lstlisting}[language=assembly]
+addu $a0, $v0, $zero
+\end{lstlisting}
+
+We can see that it effectively does the same thing by setting \$a0 to
+the result of \$v0 + 0 but we avoid having to implement a dedicated
+``move'' instruction in the CPU.
+
+\subsubsection{The \$ra register}
+
+\$ra (\$31) is the other general purpose register given a special
+meaning by the hardware since instructions like ``jump and link'' or
+``branch and link'' put the return address in this register
+exclusively. So the following instruction jumps in function
+\texttt{foo} and puts the return address in \$ra:
+
+\begin{lstlisting}[language=assembly]
+jal foo
+\end{lstlisting}
+
+As we'll soon see we don't really have to bother with the various
+roles assigned to those general purpose registers when writing our
+emulator (with the exception of \$zero and \$ra) but it's still useful
+to know the convention when trying to understand what some emulated
+code is doing.
+
+\subsection{CPU special purpose registers}
+
+\begin{table}[ht]
+  \centering
+
+  \begin{tabular}{ l | l }
+    Name        & Description     \\
+    \hline
+    PC          & Program counter \\
+    HI          & high 32bits of multiplication result; remainder of
+                  division \\
+    LO          & low 32bits of multiplication result; quotient of
+                  division \\
+  \end{tabular}
+
+  \caption{R3000 CPU special purpose registers}
+  \label{tab:specialcpuregs}
+\end{table}
+
+Table~\ref{tab:specialcpuregs} lists the three \emph{special purpose}
+CPU registers. We're already familiar with the PC used to keep track
+of the code execution. The two others are HI and LO which contain the
+results of multiplication and division instructions. Those cannot be
+used as general purpose registers, instead there are special
+instructions used to manipulate them. We'll discover them as we
+implement them.
+
+\subsection{Implementing the general purpose registers}
+
+I'm just going to represent the 32 general purpose registers as an
+array of 32 \texttt{u32} and use the index in the instructions to
+address them. I'll even have an entry for \$zero even though it's
+always 0 to avoid special cases. Of course we'll have
+to be careful to always keep its value to 0.
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    /// The program counter register
+    pc: u32,
+    /// General Purpose Registers.
+    /// The first entry must always contain 0.
+    regs: [u32; 32],
+    /// Memory interface
+    inter: Interconnect,
+}
+\end{lstlisting}
+
+The registers are not initialized on reset, so they contain garbage
+value when we start up. For the sake of our emulator being
+deterministic I won't actually put random values in the registers
+however, instead I'm going to use an arbitrary garbage value
+\texttt{0xdeadbeef}. We could as well initialize them to 0 but I
+prefer to use a more distinguishable value which can be helpful while
+debugging. We must remember to put 0 in \$zero however.
+
+\begin{lstlisting}
+impl Cpu {
+    pub fn new(inter: Interconnect) -> Cpu {
+        // Not sure what the reset values are...
+        let mut regs = [0xdeadbeef; 32];
+
+        // ... but R0 is hardwired to 0
+        regs[0] = 0;
+
+        Cpu {
+            // PC reset value at the beginning of the BIOS
+            pc: 0xbfc00000,
+            regs: regs,
+            inter: inter,
+        }
+    }
+
+    fn reg(&self, index: u32) -> u32 {
+        self.regs[index as usize]
+    }
+
+    fn set_reg(&mut self, index: u32, val: u32) {
+        self.regs[index as usize] = val;
+
+        // Make sure R0 is always 0
+        self.regs[0] = 0;
+    }
+
+    // ...
+}
+\end{lstlisting}
+
+I've also added a getter and a setter. They're very straightforward
+but I take care to always write 0 in \$zero in case it gets
+overwritten. I don't ever bother checking if the function wrote in
+this register or an other one, writing a 32bit value is cheap and
+probably cheaper than adding an \texttt{if}.
+
+\subsection{LUI instruction}
+
+Now we can finally implement our first instruction in full! Here's
+what \texttt{op\_lui} looks like now:
+
+\begin{lstlisting}
+impl Cpu {
+
+    // ...
+
+    /// Load Upper Immediate
+    fn op_lui(&mut self, instruction: Instruction) {
+        let i = instruction.imm();
+        let t = instruction.t();
+
+        // Low 16bits are set to 0
+        let v = i << 16;
+
+        self.set_reg(t, v);
+    }
+}
+\end{lstlisting}
+
+Note that the low 16bits are set to 0. It's important as we'll see
+with the next instruction.
+
+The first instruction in the BIOS uses LUI to put 0x13 in the high
+16bits of \$8.
+
+\subsection{ORI instruction}
+
+We can directly implement the 2nd instruction: `0x3508243f`.
+
+It decodes to:
+
+\begin{lstlisting}[language=assembly]
+ori $8, $8, 0x243f
+\end{lstlisting}
+
+In other words, it puts the result of the \emph{bitwise or} of \$8 and
+0x243f back into \$8. The previous LUI initialized the high
+16bits of \$8 and set the rest to 0 so this one will initialize the
+low 16bits.
+
+That's the simplest way to load a constant in a register with the MIPS
+instruction set and that's why it's important for LUI to set the low
+16bits to 0, otherwise the ORI wouldn't do the right thing.
+
+The implementation is straightforward:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    fn decode_and_execute(&mut self, instruction: Instruction) {
+        match instruction.function() {
+            0b001111 => self.op_lui(instruction),
+            0b001101 => self.op_ori(instruction),
+            _        => panic!("Unhandled instruction {:x}",
+                               instruction.0),
+        }
+    }
+
+    /// Bitwise Or Immediate
+    fn op_ori(&mut self, instruction: Instruction) {
+        let i = instruction.imm();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let v = self.reg(s) | i;
+
+        self.set_reg(t, v);
+    }
+}
+\end{lstlisting}
+
+After those two instructions the value of \$8 should be
+\texttt{0x0013243f}. The next instruction as an other LUI which puts
+\texttt{0x1f800000} in \$1.
+
+\subsection{Writing to memory}
+
+The next instruction, \texttt{0xac281010}, is going to give us a
+little more trouble. It decodes to the ``store word'' instruction:
+
+\begin{lstlisting}[language=assembly]
+sw $8, 0x1010($1)
+\end{lstlisting}
+
+If you're not familiar with GNU assembly syntax the
+\texttt{0x1010(\$1)} syntax means ``address in \$1 plus offset
+0x1010''. In this case the full instruction is ``store the 32bits in
+register \$8 at the location \$1 + 0x1010''. Given the current values
+of the \$1 and \$8 registers it would store \texttt{0x0013243f} at the
+address \texttt{0x1f801010}.
+
+We can implement the storing to memory by mirroring our
+\texttt{load32} code:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    /// Store 32bit value into the memory
+    fn store32(&mut self, addr: u32, val: u32) {
+        self.inter.store32(addr, val);
+    }
+
+    fn decode_and_execute(&mut self, instruction: Instruction) {
+        match instruction.function() {
+            0b001111 => self.op_lui(instruction),
+            0b001101 => self.op_ori(instruction),
+            0b101011 => self.op_sw(instruction),
+            _        => panic!("Unhandled instruction {:x}", instruction.0),
+        }
+    }
+
+    // ...
+
+    /// Store Word
+    fn op_sw(&mut self, instruction: Instruction) {
+        let i = instruction.imm();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+        let v    = self.reg(t);
+
+        self.store32(addr, v);
+    }
+}
+\end{lstlisting}
+
+This code for \texttt{op\_sw} is actually subtly broken, I'll explain
+why in a moment. For these values of \texttt{addr} and \texttt{i}
+it'll do the right thing though. You can see that we call into the
+interconnect's \texttt{store32} method that we have yet to
+implement. Since the only peripheral we support so far is the BIOS ROM
+and we
+\href{https://github.com/simias/psx-hardware-tests/blob/master/tests/bios_write/main.s}{can't
+  write to it} there's not much we can do at that point, let's just
+log the access and panic:
+
+\begin{lstlisting}
+impl Interconnect {
+    // ...
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+        panic!("unhandled store32 into address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+\subsubsection{Unaligned memory access}
+
+While we're at it I just realized that so far we allow 32bit fetch and
+store from and to any address. However the architecture won't allow
+unaligned memory accesses (i.e. 32bit accesses must have an address
+which is a multiple of 32bits). Many architectures don't support
+unaligned accesses (it generates a ``bus error'') and those who do
+usually implement it at a cost (unaligned accesses are slower). I'd
+rather add some code in the functions to catch unaligned access, it
+could help us catch unexpected behaviours when debugging:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 32bit word at `addr`
+    pub fn load32(&self, addr: u32) -> u32 {
+
+        if addr % 4 != 0 {
+            panic!("Unaligned load32 address: {:08x}", addr);
+        }
+
+        //...
+    }
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+
+        if addr % 4 != 0 {
+            panic!("Unaligned store32 address: {:08x}", addr);
+        }
+
+	//...
+    }
+}
+\end{lstlisting}
+
+Once we implement exceptions we'll be able to handle those conditions
+properly.
+
+The code should now compile but unsurprisingly it won't manage to
+execute the `SW` instruction in full:
+
+\begin{verbatim}
+thread '<main>' panicked at 'unhandled store32 into address 1f801010'
+\end{verbatim}
+
+The address is not part of the BIOS and therefore we don't support it
+yet. We can figure out where we're trying to write by going back to
+the memory map in table~\ref{tab:mmap}. We can see that we end up in
+the "Hardware registers" range.
+
+Looking at the specs we see that registers in this range are for
+``memory control''. They're mainly used to set things like access
+latencies to the various peripherals. We're going to hope we don't
+need to emulate those very low level settings so we'll ignore the
+writes to those registers for now.
+
+\subsubsection{Expansion mapping}
+
+There are two memory control registers we need to be careful about
+however: registers \texttt{0x1f801000} and \texttt{0x1f801004} contain
+the base address of the expansion 1 and 2 register maps. We could
+emulate dynamic mappings but apparently on the Playstation they're
+always at \texttt{0x1f000000} and \texttt{0x1f802000} respectively so
+we're just going to hardcode those addresses and raise an error if the
+BIOS or a game ever attempts to remap them to something else (which
+hopefully shouldn't ever happen).
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+        //...
+
+        if let Some(offset) = map::MEM_CONTROL.contains(addr) {
+            match offset {
+                0 => // Expansion 1 base address
+                    if val != 0x1f000000 {
+                        panic!("Bad expansion 1 base address: 0x{:08x}", val);
+                    },
+                4 => // Expansion 2 base address
+                    if val != 0x1f802000 {
+                        panic!("Bad expansion 2 base address: 0x{:08x}", val);
+                    },
+                _ =>
+                    println!("Unhandled write to MEM_CONTROL register {:x}: \
+                              0x{:08x}",
+                             offset, val),
+            }
+            return;
+        }
+
+	panic!("unhandled store32 into address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+And of course we need to declare the \texttt{MEM\_CONTROL} constant:
+
+\begin{lstlisting}
+/// Memory latency and expansion mapping
+pub const MEM_CONTROL: Range = Range(0x1f801000, 36);
+\end{lstlisting}
+
+It's a bit hackish but at least the store will now go through.
+
+Before we move on to the next instruction we need to address the
+``subtle brokenness'' in our `SW` implementation I was talking about
+earlier.
+
+\subsection{Sign extension}
+
+The reason our current ``Store word'' extension is broken is because
+we're not handling the immediate value correctly. It should be
+interpreted like a signed 16bit value in a
+\href{https://en.wikipedia.org/wiki/Two%27s_complement}{two's complement}
+representation.
+
+In other words, if the immediate value of the SW was \texttt{0xffff}
+it would give an offset of -1, not +65535.
+
+\begin{table}[ht]
+  \centering
+
+  \begin{tabular}{ l | l | l }
+    16bit value & 32bit ``unsigned'' extended value & decimal unsigned value \\
+    \hline
+    \texttt{0x0000} & \texttt{0x00000000} & 0     \\
+    \texttt{0x0001} & \texttt{0x00000001} & 1     \\
+    \texttt{0x01ad} & \texttt{0x000001ad} & 429   \\
+    \texttt{0xffff} & \texttt{0x0000ffff} & 65535 \\
+    \texttt{0x83c5} & \texttt{0x000083c5} & 33733 \\
+    \hline
+    \hline
+    16bit value & 32bit sign-extended value & decimal signed value \\
+    \hline
+    \texttt{0x0000} & \texttt{0x00000000} & 0      \\
+    \texttt{0x0001} & \texttt{0x00000001} & 1      \\
+    \texttt{0x01ad} & \texttt{0x000001ad} & 429    \\
+    \texttt{0xffff} & \texttt{0xffffffff} & -1     \\
+    \texttt{0x83c5} & \texttt{0xffff83c5} & -31803 \\
+  \end{tabular}
+
+  \caption{16 to 32bit conversion: with and without sign extension}
+  \label{tab:signextend}
+\end{table}
+
+In order to support this we don't need to add any branching, we just
+need to \href{https://en.wikipedia.org/wiki/Sign_extension}{sign
+  extend} the immediate value. It means that we increase the width of
+the 16bit value to 32bit but instead of padding with zeroes we pad
+with the original MSB (which is sometimes called the
+\href{https://en.wikipedia.org/wiki/Sign_bit}{sign bit}). This way the
+signed value remains the same. See table~\ref{tab:signextend} for some
+examples.
+
+You can see that for values where the sign bit is not set if we simply
+pad the 16 high bits with 0s we get the same result in both signed and
+unsigned extension. However for values with the MSB set to 1 we have a
+big difference. So when we extend values it's important to know if
+we're dealing with signed or unsigned quantities. We'll have the same
+problem with rightwise bitshifts: if we're shifting signed quantities
+we have to pad with the sign bit.
+
+It might sounds complicated but it's very straightforward to implement
+with most programming languages, for instance in C, C++ and Rust
+simply casting from a 16bit signed integer to a 32bit integer makes
+the compiler sign-extend the value. If it didn't casting a 16bit
+variable containing -1 into a 32bit variable would have the final
+value be 65535 which is obviously not what we want.
+
+We can't guess which instructions use signed or unsigned immediate
+values, it's described in the MIPS instruction set. For instance our
+ORI instruction correctly uses an unsigned immediate value.
+
+The nice thing with two's complement representation is that while we
+need to think about the signedness of the value when bitshifting and
+widening it doesn't matter for most arithmetic operations.
+
+For instance the 16 bit addition 0x01ad + 0x84e0 gives the same result
+whether the operands are signed or not: 0x01ad is 429, 0x84e0 is
+either 34016 if it's unsigned or -31520 if it's a two's complement
+signed value. 429 + 34016 is 34445 or 0x868d in hexadecimal. 429 -
+31520 is -31091 or 0x868d in 16bit two's complement hexadecimal.
+
+You can see that doing the calculation with signed or unsigned
+quantities doesn't matter: we end up with the same binary pattern.
+
+Therefore we just need to care about the sign when widening the
+immediate from 16 to 32 bits and then we can proceed with our usual
+"unsigned" addition and we'll get the correct result whether the
+offset is negative or positive:
+
+\begin{lstlisting}
+impl Instruction {
+    // ...
+
+    /// Return immediate value in bits [16:0] as a sign-extended 32bit
+    /// value
+    fn imm_se(self) -> u32 {
+        let Instruction(op) = self;
+
+        let v = (op & 0xffff) as i16;
+
+        v as u32
+    }
+}
+\end{lstlisting}
+
+Note the order of the casts from \texttt{u32} to \texttt{i16} back to
+\texttt{u32}. They might look useless but that's what's forcing the
+compiler to generate instructions to sign-extend \texttt{v}.
+
+\subsection{SW instruction}
+
+We can now use this function to fix \texttt{op\_sw}, we just have to
+replace \texttt{instruction.imm()} with the new sign-extending
+\texttt{instruction.imm\_se()}`:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    /// Store Word
+    fn op_sw(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+        let v    = self.reg(t);
+
+        self.store32(addr, v);
+    }
+}
+\end{lstlisting}
+
+This version of SW should work correctly even if the offset \texttt{i}
+is negative.
+
+\subsection{SLL instruction}
+
+The next instruction is simply \texttt{0x00000000}. Looks strange but
+it's perfectly valid. As always we start by reading the bits [31:26]
+which obviously gives us \texttt{0b000000}. This value however can
+introduce a number of instructions, to figure out which one we need to
+read bits [5:0] which are again full zeroes. By looking at the
+instruction set reference we see that these value correspond to a SLL
+or ``Shift Left Logical''. If we decode the entire instruction we end
+up with:
+
+\begin{lstlisting}[language=assembly]
+sll $zero, $zero, 0
+\end{lstlisting}
+
+Obviously this instruction does absolutely nothing. For one storing in
+\$zero does nothing and shifting any register by 0 doesn't do anything
+either. This instruction (and its noticeable encoding as full 0s) is
+just the preferred way to encode a
+\href{https://en.wikipedia.org/wiki/NOP}{NOP}\footnote{MIPS assemblers
+  actually feature a \texttt{nop} pseudo-instruction that generates
+  this \mbox{\texttt{sll \$zero, \$zero, 0}} instruction}. In this case I can
+only assume that it's waiting for the previous SW instructions to take
+effect but I'm not entirely sure why they are needed.
+
+In our emulator we won't special-case this particular instruction, we
+can just implement the generic SLL instruction in full. Since NOPs are
+pretty common it might make some sense to special-case them but we'll
+need to benchmark it to make sure the cost of the test won't be
+greater than computing a useless shift and storing it in \$zero.
+
+Let's start by implementing the accessors (the shift immediate is only
+5bits since it wouldn't make sense to shift by more than 31 places and
+the rest of the low bits is taken by the ``subfunction'' part of the
+instruction):
+
+\begin{lstlisting}
+impl Instruction {
+    // ...
+
+    /// Return register index in bits [15:11]
+    fn d(self) -> u32 {
+        let Instruction(op) = self;
+
+        (op >> 11) & 0x1f
+    }
+
+    /// Return bits [5:0] of the instruction
+    fn subfunction(self) -> u32 {
+        let Instruction(op) = self;
+
+        op & 0x3f
+    }
+
+    /// Shift Immediate values are stored in bits [10:6]
+    fn shift(self) -> u32 {
+        let Instruction(op) = self;
+
+        (op >> 6) & 0x1f
+    }
+}
+\end{lstlisting}
+
+Now that we have our fancy getter to parse the instruction we can use it in
+our decoding function and the implementation is very straightforward:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    fn decode_and_execute(&mut self, instruction: Instruction) {
+        match instruction.function() {
+            0b000000 => match instruction.subfunction() {
+                0b000000 => self.op_sll(instruction),
+                _        => panic!("Unhandled instruction {:08x}",
+                                   instruction.0),
+            },
+            0b001111 => self.op_lui(instruction),
+            0b001101 => self.op_ori(instruction),
+            0b101011 => self.op_sw(instruction),
+            _        => panic!("Unhandled instruction {:08x}",
+                               instruction.0),
+        }
+    }
+
+    /// Shift Left Logical
+    fn op_sll(&mut self, instruction: Instruction) {
+        let i = instruction.shift();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let v = self.reg(t) << i;
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{ADDIU instruction}
+
+After that we encounter the instruction ``0x24080b88'' which is the
+``Add Immediate Unsigned'' opcode. The name is completely misleading: it
+seems to say that the immediate value is treated as unsigned (i.e. not
+zero-extended instead of sign-extended) but it's not the case. The
+only difference between ADDIU and ADDI (``Add Immediate'') is that
+the latter generates an exception on overflow while the former simply
+truncates the result. How they got to ``unsigned'' from that I have no
+idea...
+
+Knowing that it's easy to implement it in our emulator\footnote{I'll
+  skip the code in \texttt{decode\_and\_execute} from now on, I'm sure
+  you can figure it out by yourself\ldots{}}:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    /// Add Immediate Unsigned
+    fn op_addiu(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let v = self.reg(s).wrapping_add(i);
+
+        self.set_reg(t, v);
+    }
+}
+\end{lstlisting}
+
+If you decode the instruction in full you should end up with:
+
+\begin{lstlisting}[language=assembly]
+addiu $8, $zero, 0xb88
+\end{lstlisting}
+
+You can see an other use of the \$zero register: this time with the
+ADDIU opcode it sets \$8 to the immediate value 0xb88. It saves having
+a dedicated ``Load immediate'' opcode.
+
+\subsection{RAM configuration register}
+
+This value of \texttt{0x00000b88} is then stored at address
+\texttt{0x1f801060}.
+
+This register is called \texttt{RAM\_SIZE} in the
+\href{problemkaputt.de/psx-spx.htm#memorycontrol}{NoCash specs}. The
+exact purpose of this register remains partially unknown but it seems
+to be configuring the memory controller. I assume that this controller
+is capable of handling various amounts of RAM for instance and this
+register lets the BIOS load the particular configuration needed by the
+Playstation hardware.
+
+At any rate, since we're trying to emulate the Playstation and not
+some generic MIPS computer we probably don't have to handle this
+register in any specific way so it's hopefully safe to ignore it. I
+just add a new mapping entry, ignore the store at this address and
+move along:
+
+\begin{lstlisting}
+/// Register that has something to do with RAM configuration,
+/// configured by the BIOS
+pub const RAM_SIZE: Range = Range(0x1f801060, 4);
+\end{lstlisting}
+
+After this instruction we get a few NOPs. We can imagine that the
+ram size configuration takes a few cycle to take effect and the BIOS
+delays a bit before continuing.
+
+\commit{017db106ea}
+
+\newpage
+
+\listoftables
 
 \end{document}

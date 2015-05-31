@@ -7,4 +7,5 @@ $(NAME).pdf: $(NAME).tex
 	while grep -q "Rerun to" $(NAME).log; do $(PDFLATEX) $^ ; done
 
 clean:
-	rm -f $(NAME).aux $(NAME).log $(NAME).out $(NAME).toc $(NAME).pdf
+	rm -f $(NAME).aux $(NAME).log $(NAME).out \
+              $(NAME).toc $(NAME).lot $(NAME).pdf
