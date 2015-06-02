@@ -28,8 +28,10 @@
 
 \lstdefinelanguage{assembly}%
   {
-   morekeywords={nop,lui,move,addu,addiu,jal,sll,%
-                 sw,sh,sb,%
+   morekeywords={nop,lui,move,addu,addiu,addi,j,jal,sll,%
+                 sw,sh,sb,or,ori,%
+                 mtc0,mtc1,mtc2,mtc3,%
+                 bne,%
                  },%
    sensitive,%
    moredelim=[s]{::}{::},%
@@ -79,7 +81,9 @@
 
 This is my attempt at documenting my implementation of a PlayStation
 emulator from scratch. I'll write the document as I go and I'll try to
-explain as much as possible along the way.
+explain as much as possible along the way. You can find the complete
+source of the emulator itself in my
+\href{https://github.com/simias/psx-rs}{GitHub repository}.
 
 Since my favourite passtime is to reinvent the wheel and recode things
 that already exist I decided that this time I might as well document
@@ -104,10 +108,7 @@ that pesky hardware in person!
 
 Since this is supposed to be a general guide about writing PlayStation
 emulators I won't put the entire source code of the emulator here,
-only snippets relevant to the matter beind discussed. The code will
-live in an other repository and I'll just reference individual commits
-when implementing certain features so that you can see the entire code
-in context if you want.
+only snippets relevant to the matter beind discussed.
 
 Finally, keep in mind that getting a PlayStation emulator even capable
 to run \emph{some} games decently will require quite a lot of work. Don't
@@ -824,7 +825,8 @@ decimal. Bits [25:21] are not used and their value doesn't matter.
 
 In other words this instruction puts \texttt{0x13} in the 16 high bits
 of the register 8. In MIPS assembly\footnote{I'm using the GNU
-assembler syntax in this guide} it would be equivalent to:
+  assembler syntax in this guide unless otherwise noted.} it would be
+equivalent to:
 
 \begin{lstlisting}[language=assembly]
 lui $8, 0x13
@@ -1503,7 +1505,7 @@ either. This instruction (and its noticeable encoding as full 0s) is
 just the preferred way to encode a
 \href{https://en.wikipedia.org/wiki/NOP}{NOP}\footnote{MIPS assemblers
   actually feature a \texttt{nop} pseudo-instruction that generates
-  this \mbox{\texttt{sll \$zero, \$zero, 0}} instruction}. In this case I can
+  this \mbox{\texttt{sll \$zero, \$zero, 0}} instruction.}. In this case I can
 only assume that it's waiting for the previous SW instructions to take
 effect but I'm not entirely sure why they are needed.
 
@@ -1647,11 +1649,578 @@ move along:
 pub const RAM_SIZE: Range = Range(0x1f801060, 4);
 \end{lstlisting}
 
-After this instruction we get a few NOPs. We can imagine that the
-ram size configuration takes a few cycle to take effect and the BIOS
-delays a bit before continuing.
+After this instruction we get a few NOPs. I suppose that the ram size
+configuration takes a few cycle to take effect and the BIOS delays a
+bit before continuing.
 
-\commit{017db106ea}
+\subsection{J instruction}
+
+The next instruction is \texttt{0x0bf00054} which is a jump
+instruction (J). This function is used to change the value of the PC
+and have the CPU execution pipeline jump to some other location in
+memory.
+
+Jump behaves like a \emph{goto}: it sets the PC to the immediate value
+contained in the instruction. Since the instruction is 32bit wide and
+the instruction set uses 6bits to encode the opcode it can only
+specify 26bits of the `PC` at once.
+
+To make the most of those 26bits the target address is shifted two
+places to the right. It's not a problem because instructions must be
+aligned to a 32bit boundary so the two LSBs of the PC \emph{always}
+have to be zero. It means that the instruction really encodes 28bits
+of the target address. The remaining 4 high bits are the PC's MSB and
+remain untouched. In the case of our current instruction this makes
+the target address \texttt{0xbfc00150}.
+
+You can see that this instruction cannot jump \emph{anywhere} in RAM,
+only to an address within the current 256MB of addressable memory. If
+the CPU needs to jump further away\footnote{For instance to an other
+  region as we'll see later.} it'll have to use an other instruction
+like JR which takes a full 32bit register containing the destination
+address. But we'll see that soon enough.
+
+First we need to add an accessor for the 26bit immediate field:
+
+\begin{lstlisting}
+impl Instruction {
+    // ...
+
+    /// Jump target stored in bits [25:0]
+    fn imm_jump(self) -> u32 {
+        let Instruction(op) = self;
+
+        op & 0x3ffffff
+    }
+}
+\end{lstlisting}
+
+Now we can implement the instruction itself:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    /// Jump
+    fn op_j(&mut self, instruction: Instruction) {
+        let i = instruction.imm_jump();
+
+        self.pc = (self.pc & 0xf0000000) | (i << 2);
+    }
+}
+\end{lstlisting}
+
+Looks simple enough but unfortunately it's broken. Why you ask?
+
+\subsection{Branch delay slots}
+\label{sec:bds}
+
+The reason our implementation of ``jump'' doesn't work properly is
+because one of the simplifying assumptions we made when we started
+implementing the CPU does not hold in this case.
+
+Remember when I said that the CPU fetches and execute an instruction
+at each cycle, increments the PC and repeats? Well it's a bit more
+complicated than that.
+
+The MIPS architecture is
+\href{https://en.wikipedia.org/wiki/Classic_RISC_pipeline}{pipelined}
+It means that in order to increase the throughput of the processor it
+splits its execution logic across several stages.
+
+While one stage is busy decoding an instruction the instruction fetch
+stage could already be loading the next one. It works like an assembly
+line.
+
+When the code executes linearly (i.e. without jumps or branches)
+there's no problem: while the CPU decodes the instruction at PC the
+instruction fetch stage can start loading the value at PC + 4.
+
+But if the instruction being decoded is a jump or a branch things get
+messy. The instruction fetch stage cannot know that the previous
+instruction is supposed to change the execution path. When the
+instruction reaches the execution stage the value of PC gets updated,
+but it's too late a spurious instruction has been fetched into the
+pipeline already.
+
+So there you are, with an unwanted instruction in your pipeline. What
+do you do?
+
+Some architectures opt for flushing the pipeline in those cases. You
+restart from the correct address. Of course that's a costly operation:
+your CPU has to wait for the fresh instructions to make it all the way
+through the pipeline before getting executed. Many modern
+architectures do that and that's why they generally include complex
+\href{https://en.wikipedia.org/wiki/Branch_predictor}{branch
+  predictors} which do their best to guess if a branch is about to be
+taken. If they make a bad prediction the pipeline has to be
+flushed. That's one of the main reasons branches are considered
+expensive (and why I always overwrite \texttt{regs[0]} in
+\texttt{set\_reg} instead of checking if the register was 0).
+
+MIPS however doesn't do that. It doesn't bother wasting time flushing
+the pipeline, it just ignore the issues and run the code anyway. What
+this means is that the first instruction right \emph{after} a branch
+always gets executed \emph{before} the branch is taken,
+\emph{unconditionaly}. This instruction is said to be in the
+\href{https://en.wikipedia.org/wiki/Delay_slot}{branch delay slot}
+
+Consider the following assembly\footnote{I'm assuming that
+  the assembler is not asked to reorder the instructions. To get this
+  behaviour you have to use ``\texttt{.set noreorder}'' with the GNU
+  assembler.}:
+
+\begin{lstlisting}[language=assembly]
+j   foo
+lui $a0, 0xf00
+\end{lstlisting}
+
+The LUI instruction gets executed \emph{before} the code jumps to
+\texttt{foo}. When the function is entered \$a0 will be equal to
+\texttt{0x0f000000}.
+
+Fortunately it's pretty easy to emulate this behaviour: we just have
+to do the same thing the processor does and load the next instruction
+before we execute the current one:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    /// The program counter register
+    pc: u32,
+    /// Next instruction to be executed, used to simulate the branch
+    /// delay slot
+    next_instruction: Instruction,
+
+    // ...
+}
+
+impl Cpu {
+
+    pub fn new(inter: Interconnect) -> Cpu {
+        // ...
+
+        Cpu {
+            // PC reset value at the beginning of the BIOS
+            pc: 0xbfc00000,
+	    // ...
+            next_instruction: Instruction(0x0), // NOP
+        }
+    }
+
+    pub fn run_next_instruction(&mut self) {
+        let pc = self.pc;
+
+        // Use previously loaded instruction
+        let instruction = self.next_instruction;
+
+        // Fetch instruction at PC
+        self.next_instruction = Instruction(self.load32(pc));
+
+        // Increment PC to point to the next instruction. All
+        // instructions are 32bit long.
+        self.pc = pc + 4;
+
+        self.decode_and_execute(instruction);
+    }
+
+    // ...
+}
+\end{lstlisting}
+
+And now our jumps should behave correctly.
+
+\subsection{OR instruction}
+
+After the jump there's a sequence of LUI/ORI/SW used to store a bunch
+of values in the \texttt{SYS\_CONTROL} registers that we chose to
+ignore. We then stumbble upon a new instruction: \texttt{0x00000825}
+which encodes a \emph{bitwise or} operation:
+
+\begin{lstlisting}[language=assembly]
+or $1, $zero, $zero
+\end{lstlisting}
+
+Unlike ORI which used an immediate value as a 2nd operand this one
+takes two register and stores the result in a third one. We can see
+that in this case the two source registers are \$zero so it just
+clears \$1. The implementation is fairly straightforward:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    /// Bitwise Or
+    fn op_or(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = self.reg(s) | self.reg(t);
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+The next few instructions use OR to set \emph{all} the general purpose
+registers to 0.
+
+\subsection{Type safety in the register interface}
+
+I've decided to make a modification to our Instruction interface:
+right now the helper methods in the \texttt{Instruction} return
+register indexes as \texttt{u32}. The same type as the values
+contained in the registers. Therefore the compiler won't warn us if we
+mess up and use a register index instead of a register value:
+
+\begin{lstlisting}
+impl Cpu {
+    // ...
+
+    /// Bitwise Or
+    fn op_or(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = s | self.reg(t); // Oops...
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+This code is broken: instead of OR-ing the value of the register
+number \texttt{s} it ORs the index \texttt{s} itself. It's meaningless
+and obviously wrong and yet it builds without any error.
+
+Fortunately with a small modification in our code we can have the
+compiler reject such code by wrapping register indexes in a new type
+incompatible with \texttt{u32}:
+
+\begin{lstlisting}
+struct RegisterIndex(u32);
+\end{lstlisting}
+
+Note that this is not like a \texttt{typedef} in C or C++:
+\texttt{typedef} just creates an alias which remains compatible
+(i.e. interchangeable) with the original type. The equivalent in C
+would be to wrap the \texttt{u32} in a \texttt{struct} or something like that.
+
+Then we just have to update our helpers as well as the
+\texttt{Cpu::reg} and \texttt{Cpu::set\_reg} methods to use a
+\texttt{RegisterIndex} instead of a plain \texttt{u32}.
+
+With this modification the compiler will reject the broken
+\texttt{op\_or} implementation above:
+
+\begin{verbatim}
+Binary operation | cannot be applied to type cpu::RegisterIndex:
+     let v = s | self.reg(t);
+\end{verbatim}
+
+Hurray for type safety!
+
+
+\subsection{CACHE\_CONTROL register}
+
+The BIOS then wants to write \texttt{0x00000804} to
+\texttt{0xfffe0130}. This address is used for cache control. Since we
+won't implement the caches yet we can just add a log message and
+ignore this register for the moment:
+
+\begin{lstlisting}
+/// Cache control register
+pub const CACHE_CONTROL: Range = Range(0xfffe0130, 4);
+\end{lstlisting}
+
+\subsection{The coprocessors}
+
+The next unhandled instruction, \texttt{0x408c6000}, involves one of
+the R3000 CPU coprocessors.
+
+Coprocessors are pieces of hardware which live alongside the CPU and
+are accessed through dedicated instructions (instead of memory mapped
+I/O like external peripherals). They are used to complement and extend
+the capabilities of the processor. They each have their own set of
+registers.
+
+The MIPS R3000 CPU can support up to 4 coprocessors:
+
+\begin{itemize}
+\item The coprocessor 0 (cop0) is mandated by the MIPS architecture:
+  it's used for exception handling. Exceptions are things like
+  hardware interrupts and traps (divisions by zero, integer overflows,
+  system calls etc...). We'll study them in greater details when we'll
+  implement them.
+
+\item The coprocessor 1 (cop1) is optional: when available it's used for
+  floating point arithmetic. You might expect that a videogame console
+  would benefit greatly from having hardware accelerated floating point
+  and yet cop1 is not implemented on the playstation! Instead we have
+  the coprocessor 2.
+
+\item The coprocessor 2 (cop2) is, as far as I know, custom made for
+  the Playstation. At least I can't find any reference to it outside
+  of the Playstation hardware. It's called the "Geometry
+  Transformation Engine", or GTE for short. It implements many
+  instructions dealing with 3D transforms like perspective
+  transformations, vector and matrix multiplications, color
+  manipulation etc... It's basically the first half of the rendering
+  pipeline, the second half being the GPU (but that one is a memory
+  mapped peripheral, not a coprocessor).
+
+\item The coprocessor 3 (cop3) is not implemented on the Playstation.
+\end{itemize}
+
+Hopefully we shouldn't have to mess with the GTE until we start
+encountering 3D code.
+
+\subsection{MTC0 instruction}
+
+Back to the \texttt{0x408c6000} instruction: the opcode (bits [31:26])
+is equal to \texttt{0b010000} which means that it's an instruction for
+the coprocessor 0. The generic format is \texttt{0b0100}\emph{nn} where
+\emph{nn} is the coprocessor number.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    fn decode_and_execute(&mut self, instruction: Instruction) {
+        match instruction.function() {
+	    //...
+            0b010000 => self.op_cop0(instruction),
+            _        => panic!("Unhandled instruction {}",
+                               instruction),
+        }
+    }
+
+    /// Coprocessor 0 opcode
+    fn op_cop0(&mut self, instruction: Instruction) {
+        match instruction.cop_opcode() {
+            0b00100 => self.op_mtc0(instruction),
+            _       => panic!("unhandled cop0 instruction {}",
+                              instruction)
+        }
+    }
+}
+\end{lstlisting}
+
+\texttt{Instruction::cop\_opcode} returns the same bit range as
+\texttt{Instruction::s}, however it returns it as a plain \texttt{u32}
+instead of a \texttt{RegisterIndex} (since it's not a register in this
+case). You see that the current coprocessor opcode \texttt{0b00100} means
+MTC0 or ``move to coprocessor 0''. This instruction takes two
+parameters: the source register index (one of the CPU's general
+registers) and the target register (one of the coprocessor's
+register). Those parameters are respectively in bits [20:16] and
+[15:11] of the instruction.
+
+In our current instruciton both of those parameters are equal to 12 so
+if we decode the instruction in full it gives\footnote{This is
+  actually pseudo-assembly for the sake of clarity. The correct GNU
+  assembler syntax would be \mbox{\texttt{mtc0 \$12, \$12}} but it's a
+bit too ambiguous for my taste.}:
+
+\begin{lstlisting}[language=assembly]
+mtc0 $12, $cop0_12
+\end{lstlisting}
+
+\texttt{\$cop0\_12} is a very useful register: it's called the
+``status register'' or SR for short. Among other things it's used to
+query and mask the exceptions and controlling the cache behaviour.
+
+At this point the \$12 register contains \texttt{0x00010000} so this
+MTC0 instruction sets bit 16 of SR which is the ``isolate cache''
+bit. It makes all the following read and write target directly the
+cache instead of going through it towards the main memory. We're
+probably in the middle of the cache initialization sequence.
+
+At any rate since we still haven't implemented anything cache-related
+we'll just store the value of the SR in our \texttt{Cpu} struct and
+move along:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    //...
+
+    /// Cop0 register 12: Status Register
+    sr: u32,
+}
+
+impl Cpu {
+    //...
+
+    pub fn new(inter: Interconnect) -> Cpu {
+        //...
+
+        Cpu {
+	    //...
+	    sr: 0,
+        }
+    }
+
+    fn op_mtc0(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = self.reg(cpu_r);
+
+        match cop_r {
+            12 => self.sr = v,
+            n  => panic!("Unhandled cop0 register: {:08x}", n),
+        }
+    }
+}
+\end{lstlisting}
+
+Setting the SR to 0 on reset might not be accurate but I doubt it
+matters much.
+
+Since the cache is supposed to be isolated all ``stores'' should end
+up in the cache and never in the main memory. Even if we don't
+implement the cache we don't want the BIOS to start writing at random
+locations in main memory when it thinks it writes to the cache so we
+can start by ignoring all writes when this isolation bit is set:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Store Word
+    fn op_sw(&mut self, instruction: Instruction) {
+
+        if self.sr & 0x10000 != 0 {
+            // Cache is isolated, ignore write
+            println!("ignoring store while cache is isolated");
+            return;
+        }
+
+	//...
+    }
+}
+\end{lstlisting}
+
+\subsection{BNE instruction}
+
+We now encounter the instruction \texttt{0x154bfff7}. It encodes a
+BNE or *branch if not equal* instruction. The difference between
+jumps and branches is that branches are *conditional* and they use
+*relative offsets*.
+
+The immediate value is sign extended (in order to allow for negative
+offsets) and multiplied by 4 (as always, the PC must be aligned to
+32bits at all times). Therefore this instruction decodes to:
+
+\begin{lstlisting}[language=assembly]
+bne $10, $11, -36
+\end{lstlisting}
+
+In other words the instruction will compare the values in \$10 and
+\$11 and \emph{if} they're unequal it'll subtract 36 from the
+PC. If the values are equal it'll do absolutely nothing.
+
+Like jumps, branches have a delay slot\footnote{It is called a
+  \emph{branch} delay slot after all\ldots}. Fortunately our
+implementation in section~\ref{sec:bds} already takes care of that
+without any more work.
+
+I've decided to factor the ``branching'' code itself in a separate
+function because we'll have to use the same logic in the other branch
+instructions:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Branch to immediate value `offset`.
+    fn branch(&mut self, offset: u32) {
+        // Offset immediates are always shifted two places to the
+        // right since `PC` addresses have to be aligned on 32bits at
+        // all times.
+        let offset = offset << 2;
+
+        let mut pc = self.pc;
+
+        pc = pc.wrapping_add(offset);
+
+        // We need to compensate for the hardcoded
+        // `pc.wrapping_add(4)` in `run_next_instruction`
+        pc = pc.wrapping_sub(4);
+
+        self.pc = pc;
+    }
+
+    /// Branch if Not Equal
+    fn op_bne(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        if self.reg(s) != self.reg(t) {
+            self.branch(i);
+        }
+    }
+}
+\end{lstlisting}
+
+Notice the \texttt{wrapping\_sub(4)} to compensate for our hardcoded
+\texttt{pc.wrapping\_add(4)} in
+\texttt{run\_next\_instruction}. Without it we'd branch one
+instruction too far.
+
+\subsection{ADDI instruction}
+
+Before we even reach the target of the branch we stumble upon
+unhandled instruction \texttt{0x214a0080}. This one is an ADDI which
+behaves exactly like the ADDIU instruction we've already implemented
+except that it generates an exception if the addition overflows.
+
+The instruction decodes to:
+\begin{lstlisting}[language=assembly]
+addi $10, $10, 128
+\end{lstlisting}
+
+Since this operation checks for signed overflow I'll cast the operands
+to \texttt{i32} before using the \texttt{checked\_add} provided by
+rust's standard library\footnote{If you're implementing this in C or
+  C++ and need to check for signed overflow yourself you'll find
+  plenty of examples online. Welcome to the 1970s. Be careful with
+  your implementation though because signed integer overflow is
+  undefined behaviour in C.}. For now I just panic if we encounter an
+  overflow, we'll change that when we actually implement exceptions:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Add Immediate Unsigned and check for overflow
+    fn op_addi(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se() as i32;
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let s = self.reg(s) as i32;
+
+        let v = match s.checked_add(i) {
+            Some(v) => v as u32,
+            None    => panic!("ADDI overflow"),
+        };
+
+        self.set_reg(t, v);
+    }
+}
+\end{lstlisting}
+
+The cast to \texttt{i32} is important because something like
+\texttt{0x4 + 0xffffffff} is an overflow in 32bit unsigned
+arithmetics. If the operands are signed however it's simply 4 + -1 and
+that's obviously perfectly fine. The actual result of the operation
+would be the same (\texttt{0x00000003}) but since ADDI generates an
+exception on overflow the difference in behaviour is critical.
 
 \newpage
 
