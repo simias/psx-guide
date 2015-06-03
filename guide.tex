@@ -31,6 +31,7 @@
    morekeywords={nop,lui,move,addu,addiu,addi,j,jal,sll,%
                  sw,sh,sb,or,ori,%
                  mtc0,mtc1,mtc2,mtc3,%
+                 li,lw,%
                  bne,%
                  },%
    sensitive,%
@@ -65,6 +66,8 @@
     \href{https://github.com/simias/psx-rs/commit/#1}{commit
       \texttt{#1}}}
   \medskip}
+
+\newcommand{\code}[1] {\texttt{#1}}
 
 \title{Playstation Emulation Guide}
 \date{\today}
@@ -160,7 +163,7 @@ need to explain how a CPU works.
 
 A simple Von Neumann architecture looks like this: the CPU only sees a
 flat address space: an array of bytes. The PlayStation uses 32bit
-addresses so the CPU sees \texttt{1 << 32} addresses which means it
+addresses so the CPU sees \code{1 << 32} addresses which means it
 can address 4GB of memory. That's why the PlayStation is said to be a
 32bit console (that and the fact that it uses 32bit registers in the
 CPU as we'll see in a minute).
@@ -261,18 +264,18 @@ impl Cpu {
 }
 \end{lstlisting}
 
-In Rust \texttt{wrapping\_add} means that we want the PC to
-wrap back to 0 in case of an overflow (i.e. \texttt{0xfffffffc + 4 =>
+In Rust \code{wrapping\_add} means that we want the PC to
+wrap back to 0 in case of an overflow (i.e. \code{0xfffffffc + 4 =>
 0x00000000}). We'll see that most CPU operations wrap on overflow
 (although some instructions catch those overflows and generate an
 exception, we'll see that later). The PC is no exception.
 
 If you're coding in C you don't need to worry about that if you use
-\texttt{uint32\_t} since the C standard mandates that unsigned overflow wraps
+\code{uint32\_t} since the C standard mandates that unsigned overflow wraps
 around in this fashion. Rust however says that overflows are undefined
 and will generate an error in debug builds if an unchecked overflow is
-detected, that's why I need to write \texttt{pc.wrapping\_add(4)} instead of
-\texttt{pc + 4}.
+detected, that's why I need to write \code{pc.wrapping\_add(4)} instead of
+\code{pc + 4}.
 
 We now finally have some code but it doesn't build yet.
 
@@ -281,8 +284,8 @@ piece of code:
 
 \begin{itemize}
  \item What's the initial value of PC when starting up?
- \item How do we implement the \texttt{fetch32} function?
- \item How do we implement the \texttt{decode\_and\_execute} function?
+ \item How do we implement the \code{fetch32} function?
+ \item How do we implement the \code{decode\_and\_execute} function?
 \end{itemize}
 
 \subsubsection{Reset value of the PC}
@@ -313,7 +316,7 @@ it should start running the code. It basically defines the location of
 the "main" function of the console's kernel.
 
 The docs say that the reset value of PC is
-\texttt{0xbfc00000}. In the playstation memory map that's the
+\code{0xbfc00000}. In the playstation memory map that's the
 beginning of the BIOS (we'll look at the memory map in greater details
 in the next section).
 
@@ -355,15 +358,15 @@ Here's an overview of the PlayStation memory map, courtesy of
   \begin{tabular}{ l | l | l | r | l }
     KUSEG & KSEG0 & KSEG1 & Length & Description \\
     \hline
-    \texttt{0x00000000} & \texttt{0x80000000} & \texttt{0xa0000000} & 2048K
+    \code{0x00000000} & \code{0x80000000} & \code{0xa0000000} & 2048K
      & Main RAM \\
-    \texttt{0x1f000000} & \texttt{0x9f000000} & \texttt{0xbf000000} & 8192K
+    \code{0x1f000000} & \code{0x9f000000} & \code{0xbf000000} & 8192K
      & Expansion Region 1 \\
-    \texttt{0x1f800000} & \texttt{0x9f800000} & \texttt{0xbf800000} &    1K
+    \code{0x1f800000} & \code{0x9f800000} & \code{0xbf800000} &    1K
      & Scratchpad \\
-    \texttt{0x1f801000} & \texttt{0x9f801000} & \texttt{0xbf801000} &    8K
+    \code{0x1f801000} & \code{0x9f801000} & \code{0xbf801000} &    8K
      & Hardware registers \\
-    \texttt{0x1fc00000} & \texttt{0x9fc00000} & \texttt{0xbfc00000} &  512K
+    \code{0x1fc00000} & \code{0x9fc00000} & \code{0xbfc00000} &  512K
      & BIOS ROM \\
   \end{tabular}
 
@@ -375,9 +378,9 @@ Let's take the time to parse through this.
 
 We can see that most peripherals in table~\ref{tab:mmap} are mapped at
 several addresses. For instance if we look at the PC reset
-value \texttt{0xbfc00000} corresponds to the beginning of the BIOS range in
+value \code{0xbfc00000} corresponds to the beginning of the BIOS range in
 region KSEG1. However we can also reach the same location through
-addresses \texttt{0x1fc00000}(KUSEG) and \texttt{0x9fc00000}(KSEG0).
+addresses \code{0x1fc00000}(KUSEG) and \code{0x9fc00000}(KSEG0).
 
 What's the point of having those mirrored regions? What's the
 difference between KUSEG and KSEG1 for instance? Those are memory
@@ -394,7 +397,7 @@ we'll study them more closely later on.
   \begin{tabular}{ l | r | l }
     KSEG2 & Length & Description \\
     \hline
-    \texttt{0xfffe0000} & 512B & I/O Ports \\
+    \code{0xfffe0000} & 512B & I/O Ports \\
   \end{tabular}
 
   \caption{KSEG2 memory map}
@@ -464,15 +467,15 @@ guide it's probably better that we use the same file.
   \begin{tabular}{ l | l }
     Algorithm & Hash \\
     \hline
-    MD5    & \texttt{924e392ed05558ffdb115408c263dccf} \\
-    SHA1   & \texttt{10155d8d6e6e832d6ea66db9bc098321fb5e8ebf} \\
+    MD5    & \code{924e392ed05558ffdb115408c263dccf} \\
+    SHA1   & \code{10155d8d6e6e832d6ea66db9bc098321fb5e8ebf} \\
   \end{tabular}
 
-  \caption{\texttt{SCPH1001.BIN} BIOS checksums}
+  \caption{\code{SCPH1001.BIN} BIOS checksums}
   \label{tab:checksums}
 \end{table}
 
-I've decided to go for the version named \texttt{SCPH1001.BIN}. The file
+I've decided to go for the version named \code{SCPH1001.BIN}. The file
 should be *exactly* 512KB big. Check table~\ref{tab:checksums} to make
 sure you got the right one.
 
@@ -535,7 +538,7 @@ impl Bios {
 }
 \end{lstlisting}
 
-A few things to note: \texttt{offset}, as its name implies, is not the
+A few things to note: \code{offset}, as its name implies, is not the
 absolute address used by the CPU, it's just the offset in the BIOS
 memory range. Remember that the BIOS is mapped in multiple regions so
 we'll handle that in the generic interconnect code. Each peripheral
@@ -553,7 +556,7 @@ instructions are 4byte long. We have multiple way to store 4byte words
 in our "array of bytes".
 
 Let's take an example: you have the 32bit word
-\texttt{0x12345678}. You have multiple way to store that value in 4
+\code{0x12345678}. You have multiple way to store that value in 4
 consecutive bytes. We can store [0x12, 0x34, 0x56, 0x78] or
 [0x78, 0x56, 0x34, 0x12] for instance. The former is called
 \emph{big-endian} because we store the most significant byte
@@ -627,16 +630,16 @@ impl Interconnect {
 \end{lstlisting}
 
 I've decided to store the BIOS directly in the interconnect
-\texttt{struct}. We'll append the other peripherals there as we
+\code{struct}. We'll append the other peripherals there as we
 implement them. We are going to store the interconnect inside the
-\texttt{struct Cpu} which will give us a device tree with the CPU at
+\code{struct Cpu} which will give us a device tree with the CPU at
 the top. It makes the data paths pretty simple: everything goes \emph{from}
 the CPU \emph{to} the peripherals. It's easier to reason about than a full
 ``everybody sees everybody'' architecture in my opinion but it might
 prove limiting as we progress. We'll see if we need to revise that
 later.
 
-Now we can finally implement the \texttt{load32} function that the CPU
+Now we can finally implement the \code{load32} function that the CPU
 will be using. I don't like having hardcoded constants all over the
 place so I'm going to tie the address ranges to nice symbolic names:
 
@@ -662,12 +665,12 @@ mod map {
 \end{lstlisting}
 
 If you're not familiar with rust what this does is create a new type
-\texttt{Range} which is a tuple of two values: the start address and length
+\code{Range} which is a tuple of two values: the start address and length
 of the mapping.
 
-I also declare a \texttt{contains} methods which takes an address and
-returns \texttt{Some(offset)} if the address is within the range,
-\texttt{None} otherwise. You can think of it as a form of multiple
+I also declare a \code{contains} methods which takes an address and
+returns \code{Some(offset)} if the address is within the range,
+\code{None} otherwise. You can think of it as a form of multiple
 return values with some nice type-safety on top.
 
 Finally I declare our first range for the BIOS.
@@ -690,20 +693,20 @@ impl Interconnect {
 }
 \end{lstlisting}
 
-The \texttt{if let} syntax is an other rust nicety: if the
-\texttt{contains} function returns \texttt{Some(offset)} we enter the
-body of the if with \texttt{offset} bound to a temporary variable. If
-\texttt{contains} returns \texttt{None} on the other hand the
-\texttt{if} is refuted and we don't enter the body and go straight to
-the \texttt{panic!} command which will make our emulator crash.
+The \code{if let} syntax is an other rust nicety: if the
+\code{contains} function returns \code{Some(offset)} we enter the
+body of the if with \code{offset} bound to a temporary variable. If
+\code{contains} returns \code{None} on the other hand the
+\code{if} is refuted and we don't enter the body and go straight to
+the \code{panic!} command which will make our emulator crash.
 
 \subsection{Gluing the interconnect to the CPU}
 
 The only thing left before we can finally build our code is gluing the
 Interconnect with the Cpu.
 
-We add an \texttt{inter} member to the \texttt{struct Cpu} and take an
-\texttt{Interconnect} object in the constructor:
+We add an \code{inter} member to the \code{struct Cpu} and take an
+\code{Interconnect} object in the constructor:
 
 \begin{lstlisting}
 /// CPU state
@@ -728,8 +731,8 @@ impl Cpu {
 }
 \end{lstlisting}
 
-We can also implement the `load32` function for the CPU which will
-just call the interconnect.
+We can also implement the \code{load32} function for the CPU which
+will just call the interconnect.
 
 \begin{lstlisting}
 impl Cpu {
@@ -742,7 +745,7 @@ impl Cpu {
 }
 \end{lstlisting}
 
-We're still lacking the \texttt{decode\_and\_execute} function, let's use a
+We're still lacking the \code{decode\_and\_execute} function, let's use a
 placeholder function that just panics for now:
 
 \begin{lstlisting}
@@ -756,7 +759,7 @@ impl Cpu {
 }
 \end{lstlisting}
 
-Finally we can instantiate everything in our `main` function:
+Finally we can instantiate everything in our \code{main} function:
 
 \begin{lstlisting}
 fn main() {
@@ -783,17 +786,17 @@ the BIOS file was found at the correct location I get:
 thread `<main>' panicked at 'Unhandled instruction 3c080013'
 \end{verbatim}
 
-As expected the \texttt{decode\_and\_execute} function died on us but
+As expected the \code{decode\_and\_execute} function died on us but
 we managed to fetch an instruction. If you've been using the same BIOS
 file as me you should have exactly the same value of
-\texttt{0x3c080013}. If you got an other value something is wrong with
-your code. In particular if you end up with \texttt{0x1300083c} it
+\code{0x3c080013}. If you got an other value something is wrong with
+your code. In particular if you end up with \code{0x1300083c} it
 means you're erroneously reading in big-endian.
 
 \subsection{Instruction decoding}
 
 We've now fetched our first instruction from the BIOS:
-\texttt{0x3c080013}. What do we do with this?
+\code{0x3c080013}. What do we do with this?
 
 In order to be able to run this instruction we need to decode it to
 figure out what it means. Instruction encoding is of course CPU
@@ -809,21 +812,21 @@ find plenty of resources online describing its \href{https://en.wikipedia.org/wi
 Let's decode this one by hand to see how this works. If we look at the
 ``Opcode/Parameter Encoding'' table in Nocash's docs we see that we
 need to look at the bits [31:26] of the operation to see what type it
-is. In our case they are \texttt{001111}. That means the operation is
-a \texttt{LUI} or ``Load Upper Immediate''. \emph{Immediate} means
+is. In our case they are \code{001111}. That means the operation is
+a \code{LUI} or ``Load Upper Immediate''. \emph{Immediate} means
 that the value loaded is directly in the instruction, not indirectly
 somewhere else in memory. \emph{Upper} means that it's loading this
 immediate value into the high 16 bits of the target register. The 16
 low bits are cleared (set to 0).
 
 But what are the register and the value used by the instruction? Well
-we need to finish decoding it to figure it out: for a \texttt{LUI}
+we need to finish decoding it to figure it out: for a \code{LUI}
 bits [20:16] give us the target register: in our case it's
-\texttt{01000} which means it's register 8. Finally bits [15:0]
-contain the immediate value: \texttt{0000 0000 0001 0011} or 19 in
+\code{01000} which means it's register 8. Finally bits [15:0]
+contain the immediate value: \code{0000 0000 0001 0011} or 19 in
 decimal. Bits [25:21] are not used and their value doesn't matter.
 
-In other words this instruction puts \texttt{0x13} in the 16 high bits
+In other words this instruction puts \code{0x13} in the 16 high bits
 of the register 8. In MIPS assembly\footnote{I'm using the GNU
   assembler syntax in this guide unless otherwise noted.} it would be
 equivalent to:
@@ -869,7 +872,7 @@ The names for the accessor functions match those I've seen used in the
 various references to name the various fields.
 
 We can now leverage that fancy interface in
-\texttt{decode\_and\_execute}:
+\code{decode\_and\_execute}:
 
 \begin{lstlisting}
 impl Cpu {
@@ -937,7 +940,7 @@ and \$30 holds the
   pointer} (\$fp).
 
 It's important to understand that those are just a convention between
-developers, in the hardware there's no difference between \$29` and
+developers, in the hardware there's no difference between \$29 and
 \$30. The point of those
 \href{https://en.wikipedia.org/wiki/Calling_convention}{calling
   conventions} is to make it possible to make code generated from
@@ -981,7 +984,7 @@ the result of \$v0 + 0 but we avoid having to implement a dedicated
 meaning by the hardware since instructions like ``jump and link'' or
 ``branch and link'' put the return address in this register
 exclusively. So the following instruction jumps in function
-\texttt{foo} and puts the return address in \$ra:
+\code{foo} and puts the return address in \$ra:
 
 \begin{lstlisting}[language=assembly]
 jal foo
@@ -1023,7 +1026,7 @@ implement them.
 \subsection{Implementing the general purpose registers}
 
 I'm just going to represent the 32 general purpose registers as an
-array of 32 \texttt{u32} and use the index in the instructions to
+array of 32 \code{u32} and use the index in the instructions to
 address them. I'll even have an entry for \$zero even though it's
 always 0 to avoid special cases. Of course we'll have
 to be careful to always keep its value to 0.
@@ -1045,7 +1048,7 @@ The registers are not initialized on reset, so they contain garbage
 value when we start up. For the sake of our emulator being
 deterministic I won't actually put random values in the registers
 however, instead I'm going to use an arbitrary garbage value
-\texttt{0xdeadbeef}. We could as well initialize them to 0 but I
+\code{0xdeadbeef}. We could as well initialize them to 0 but I
 prefer to use a more distinguishable value which can be helpful while
 debugging. We must remember to put 0 in \$zero however.
 
@@ -1085,12 +1088,12 @@ I've also added a getter and a setter. They're very straightforward
 but I take care to always write 0 in \$zero in case it gets
 overwritten. I don't ever bother checking if the function wrote in
 this register or an other one, writing a 32bit value is cheap and
-probably cheaper than adding an \texttt{if}.
+probably cheaper than adding an \code{if}.
 
 \subsection{LUI instruction}
 
 Now we can finally implement our first instruction in full! Here's
-what \texttt{op\_lui} looks like now:
+what \code{op\_lui} looks like now:
 
 \begin{lstlisting}
 impl Cpu {
@@ -1118,7 +1121,7 @@ The first instruction in the BIOS uses LUI to put 0x13 in the high
 
 \subsection{ORI instruction}
 
-We can directly implement the 2nd instruction: `0x3508243f`.
+We can directly implement the 2nd instruction: \code{0x3508243f}.
 
 It decodes to:
 
@@ -1164,12 +1167,12 @@ impl Cpu {
 \end{lstlisting}
 
 After those two instructions the value of \$8 should be
-\texttt{0x0013243f}. The next instruction as an other LUI which puts
-\texttt{0x1f800000} in \$1.
+\code{0x0013243f}. The next instruction as an other LUI which puts
+\code{0x1f800000} in \$1.
 
 \subsection{Writing to memory}
 
-The next instruction, \texttt{0xac281010}, is going to give us a
+The next instruction, \code{0xac281010}, is going to give us a
 little more trouble. It decodes to the ``store word'' instruction:
 
 \begin{lstlisting}[language=assembly]
@@ -1177,14 +1180,14 @@ sw $8, 0x1010($1)
 \end{lstlisting}
 
 If you're not familiar with GNU assembly syntax the
-\texttt{0x1010(\$1)} syntax means ``address in \$1 plus offset
+\code{0x1010(\$1)} syntax means ``address in \$1 plus offset
 0x1010''. In this case the full instruction is ``store the 32bits in
 register \$8 at the location \$1 + 0x1010''. Given the current values
-of the \$1 and \$8 registers it would store \texttt{0x0013243f} at the
-address \texttt{0x1f801010}.
+of the \$1 and \$8 registers it would store \code{0x0013243f} at the
+address \code{0x1f801010}.
 
 We can implement the storing to memory by mirroring our
-\texttt{load32} code:
+\code{load32} code:
 
 \begin{lstlisting}
 impl Cpu {
@@ -1220,10 +1223,10 @@ impl Cpu {
 }
 \end{lstlisting}
 
-This code for \texttt{op\_sw} is actually subtly broken, I'll explain
-why in a moment. For these values of \texttt{addr} and \texttt{i}
+This code for \code{op\_sw} is actually subtly broken, I'll explain
+why in a moment. For these values of \code{addr} and \code{i}
 it'll do the right thing though. You can see that we call into the
-interconnect's \texttt{store32} method that we have yet to
+interconnect's \code{store32} method that we have yet to
 implement. Since the only peripheral we support so far is the BIOS ROM
 and we
 \href{https://github.com/simias/psx-hardware-tests/blob/master/tests/bios_write/main.s}{can't
@@ -1282,10 +1285,10 @@ Once we implement exceptions we'll be able to handle those conditions
 properly.
 
 The code should now compile but unsurprisingly it won't manage to
-execute the `SW` instruction in full:
+execute the SW instruction in full:
 
 \begin{verbatim}
-thread '<main>' panicked at 'unhandled store32 into address 1f801010'
+'<main>' panicked at 'unhandled store32 into address 1f801010'
 \end{verbatim}
 
 The address is not part of the BIOS and therefore we don't support it
@@ -1302,10 +1305,10 @@ writes to those registers for now.
 \subsubsection{Expansion mapping}
 
 There are two memory control registers we need to be careful about
-however: registers \texttt{0x1f801000} and \texttt{0x1f801004} contain
+however: registers \code{0x1f801000} and \code{0x1f801004} contain
 the base address of the expansion 1 and 2 register maps. We could
 emulate dynamic mappings but apparently on the Playstation they're
-always at \texttt{0x1f000000} and \texttt{0x1f802000} respectively so
+always at \code{0x1f000000} and \code{0x1f802000} respectively so
 we're just going to hardcode those addresses and raise an error if the
 BIOS or a game ever attempts to remap them to something else (which
 hopefully shouldn't ever happen).
@@ -1341,7 +1344,7 @@ impl Interconnect {
 }
 \end{lstlisting}
 
-And of course we need to declare the \texttt{MEM\_CONTROL} constant:
+And of course we need to declare the \code{MEM\_CONTROL} constant:
 
 \begin{lstlisting}
 /// Memory latency and expansion mapping
@@ -1351,7 +1354,7 @@ pub const MEM_CONTROL: Range = Range(0x1f801000, 36);
 It's a bit hackish but at least the store will now go through.
 
 Before we move on to the next instruction we need to address the
-``subtle brokenness'' in our `SW` implementation I was talking about
+``subtle brokenness'' in our SW implementation I was talking about
 earlier.
 
 \subsection{Sign extension}
@@ -1362,7 +1365,7 @@ interpreted like a signed 16bit value in a
 \href{https://en.wikipedia.org/wiki/Two%27s_complement}{two's complement}
 representation.
 
-In other words, if the immediate value of the SW was \texttt{0xffff}
+In other words, if the immediate value of the SW was \code{0xffff}
 it would give an offset of -1, not +65535.
 
 \begin{table}[ht]
@@ -1371,20 +1374,20 @@ it would give an offset of -1, not +65535.
   \begin{tabular}{ l | l | l }
     16bit value & 32bit ``unsigned'' extended value & decimal unsigned value \\
     \hline
-    \texttt{0x0000} & \texttt{0x00000000} & 0     \\
-    \texttt{0x0001} & \texttt{0x00000001} & 1     \\
-    \texttt{0x01ad} & \texttt{0x000001ad} & 429   \\
-    \texttt{0xffff} & \texttt{0x0000ffff} & 65535 \\
-    \texttt{0x83c5} & \texttt{0x000083c5} & 33733 \\
+    \code{0x0000} & \code{0x00000000} & 0     \\
+    \code{0x0001} & \code{0x00000001} & 1     \\
+    \code{0x01ad} & \code{0x000001ad} & 429   \\
+    \code{0xffff} & \code{0x0000ffff} & 65535 \\
+    \code{0x83c5} & \code{0x000083c5} & 33733 \\
     \hline
     \hline
     16bit value & 32bit sign-extended value & decimal signed value \\
     \hline
-    \texttt{0x0000} & \texttt{0x00000000} & 0      \\
-    \texttt{0x0001} & \texttt{0x00000001} & 1      \\
-    \texttt{0x01ad} & \texttt{0x000001ad} & 429    \\
-    \texttt{0xffff} & \texttt{0xffffffff} & -1     \\
-    \texttt{0x83c5} & \texttt{0xffff83c5} & -31803 \\
+    \code{0x0000} & \code{0x00000000} & 0      \\
+    \code{0x0001} & \code{0x00000001} & 1      \\
+    \code{0x01ad} & \code{0x000001ad} & 429    \\
+    \code{0xffff} & \code{0xffffffff} & -1     \\
+    \code{0x83c5} & \code{0xffff83c5} & -31803 \\
   \end{tabular}
 
   \caption{16 to 32bit conversion: with and without sign extension}
@@ -1453,15 +1456,15 @@ impl Instruction {
 }
 \end{lstlisting}
 
-Note the order of the casts from \texttt{u32} to \texttt{i16} back to
-\texttt{u32}. They might look useless but that's what's forcing the
-compiler to generate instructions to sign-extend \texttt{v}.
+Note the order of the casts from \code{u32} to \code{i16} back to
+\code{u32}. They might look useless but that's what's forcing the
+compiler to generate instructions to sign-extend \code{v}.
 
 \subsection{SW instruction}
 
-We can now use this function to fix \texttt{op\_sw}, we just have to
-replace \texttt{instruction.imm()} with the new sign-extending
-\texttt{instruction.imm\_se()}`:
+We can now use this function to fix \code{op\_sw}, we just have to
+replace \code{instruction.imm()} with the new sign-extending
+\code{instruction.imm\_se()}:
 
 \begin{lstlisting}
 impl Cpu {
@@ -1481,14 +1484,14 @@ impl Cpu {
 }
 \end{lstlisting}
 
-This version of SW should work correctly even if the offset \texttt{i}
+This version of SW should work correctly even if the offset \code{i}
 is negative.
 
 \subsection{SLL instruction}
 
-The next instruction is simply \texttt{0x00000000}. Looks strange but
+The next instruction is simply \code{0x00000000}. Looks strange but
 it's perfectly valid. As always we start by reading the bits [31:26]
-which obviously gives us \texttt{0b000000}. This value however can
+which obviously gives us \code{0b000000}. This value however can
 introduce a number of instructions, to figure out which one we need to
 read bits [5:0] which are again full zeroes. By looking at the
 instruction set reference we see that these value correspond to a SLL
@@ -1504,8 +1507,8 @@ Obviously this instruction does absolutely nothing. For one storing in
 either. This instruction (and its noticeable encoding as full 0s) is
 just the preferred way to encode a
 \href{https://en.wikipedia.org/wiki/NOP}{NOP}\footnote{MIPS assemblers
-  actually feature a \texttt{nop} pseudo-instruction that generates
-  this \mbox{\texttt{sll \$zero, \$zero, 0}} instruction.}. In this case I can
+  actually feature a \code{nop} pseudo-instruction that generates
+  this \mbox{\code{sll \$zero, \$zero, 0}} instruction.}. In this case I can
 only assume that it's waiting for the previous SW instructions to take
 effect but I'm not entirely sure why they are needed.
 
@@ -1594,7 +1597,7 @@ truncates the result. How they got to ``unsigned'' from that I have no
 idea...
 
 Knowing that it's easy to implement it in our emulator\footnote{I'll
-  skip the code in \texttt{decode\_and\_execute} from now on, I'm sure
+  skip the code in \code{decode\_and\_execute} from now on, I'm sure
   you can figure it out by yourself\ldots{}}:
 
 \begin{lstlisting}
@@ -1626,10 +1629,10 @@ a dedicated ``Load immediate'' opcode.
 
 \subsection{RAM configuration register}
 
-This value of \texttt{0x00000b88} is then stored at address
-\texttt{0x1f801060}.
+This value of \code{0x00000b88} is then stored at address
+\code{0x1f801060}.
 
-This register is called \texttt{RAM\_SIZE} in the
+This register is called \code{RAM\_SIZE} in the
 \href{problemkaputt.de/psx-spx.htm#memorycontrol}{NoCash specs}. The
 exact purpose of this register remains partially unknown but it seems
 to be configuring the memory controller. I assume that this controller
@@ -1655,7 +1658,7 @@ bit before continuing.
 
 \subsection{J instruction}
 
-The next instruction is \texttt{0x0bf00054} which is a jump
+The next instruction is \code{0x0bf00054} which is a jump
 instruction (J). This function is used to change the value of the PC
 and have the CPU execution pipeline jump to some other location in
 memory.
@@ -1671,7 +1674,7 @@ aligned to a 32bit boundary so the two LSBs of the PC \emph{always}
 have to be zero. It means that the instruction really encodes 28bits
 of the target address. The remaining 4 high bits are the PC's MSB and
 remain untouched. In the case of our current instruction this makes
-the target address \texttt{0xbfc00150}.
+the target address \code{0xbfc00150}.
 
 You can see that this instruction cannot jump \emph{anywhere} in RAM,
 only to an address within the current 256MB of addressable memory. If
@@ -1755,8 +1758,8 @@ architectures do that and that's why they generally include complex
   predictors} which do their best to guess if a branch is about to be
 taken. If they make a bad prediction the pipeline has to be
 flushed. That's one of the main reasons branches are considered
-expensive (and why I always overwrite \texttt{regs[0]} in
-\texttt{set\_reg} instead of checking if the register was 0).
+expensive (and why I always overwrite \code{regs[0]} in
+\code{set\_reg} instead of checking if the register was 0).
 
 MIPS however doesn't do that. It doesn't bother wasting time flushing
 the pipeline, it just ignore the issues and run the code anyway. What
@@ -1767,7 +1770,7 @@ always gets executed \emph{before} the branch is taken,
 
 Consider the following assembly\footnote{I'm assuming that
   the assembler is not asked to reorder the instructions. To get this
-  behaviour you have to use ``\texttt{.set noreorder}'' with the GNU
+  behaviour you have to use ``\code{.set noreorder}'' with the GNU
   assembler.}:
 
 \begin{lstlisting}[language=assembly]
@@ -1776,8 +1779,8 @@ lui $a0, 0xf00
 \end{lstlisting}
 
 The LUI instruction gets executed \emph{before} the code jumps to
-\texttt{foo}. When the function is entered \$a0 will be equal to
-\texttt{0x0f000000}.
+\code{foo}. When the function is entered \$a0 will be equal to
+\code{0x0f000000}.
 
 Fortunately it's pretty easy to emulate this behaviour: we just have
 to do the same thing the processor does and load the next instruction
@@ -1833,8 +1836,8 @@ And now our jumps should behave correctly.
 \subsection{OR instruction}
 
 After the jump there's a sequence of LUI/ORI/SW used to store a bunch
-of values in the \texttt{SYS\_CONTROL} registers that we chose to
-ignore. We then stumbble upon a new instruction: \texttt{0x00000825}
+of values in the \code{SYS\_CONTROL} registers that we chose to
+ignore. We then stumbble upon a new instruction: \code{0x00000825}
 which encodes a \emph{bitwise or} operation:
 
 \begin{lstlisting}[language=assembly]
@@ -1869,8 +1872,8 @@ registers to 0.
 \subsection{Type safety in the register interface}
 
 I've decided to make a modification to our Instruction interface:
-right now the helper methods in the \texttt{Instruction} return
-register indexes as \texttt{u32}. The same type as the values
+right now the helper methods in the \code{Instruction} return
+register indexes as \code{u32}. The same type as the values
 contained in the registers. Therefore the compiler won't warn us if we
 mess up and use a register index instead of a register value:
 
@@ -1892,28 +1895,28 @@ impl Cpu {
 \end{lstlisting}
 
 This code is broken: instead of OR-ing the value of the register
-number \texttt{s} it ORs the index \texttt{s} itself. It's meaningless
+number \code{s} it ORs the index \code{s} itself. It's meaningless
 and obviously wrong and yet it builds without any error.
 
 Fortunately with a small modification in our code we can have the
 compiler reject such code by wrapping register indexes in a new type
-incompatible with \texttt{u32}:
+incompatible with \code{u32}:
 
 \begin{lstlisting}
 struct RegisterIndex(u32);
 \end{lstlisting}
 
-Note that this is not like a \texttt{typedef} in C or C++:
-\texttt{typedef} just creates an alias which remains compatible
+Note that this is not like a \code{typedef} in C or C++:
+\code{typedef} just creates an alias which remains compatible
 (i.e. interchangeable) with the original type. The equivalent in C
-would be to wrap the \texttt{u32} in a \texttt{struct} or something like that.
+would be to wrap the \code{u32} in a \code{struct} or something like that.
 
 Then we just have to update our helpers as well as the
-\texttt{Cpu::reg} and \texttt{Cpu::set\_reg} methods to use a
-\texttt{RegisterIndex} instead of a plain \texttt{u32}.
+\code{Cpu::reg} and \code{Cpu::set\_reg} methods to use a
+\code{RegisterIndex} instead of a plain \code{u32}.
 
 With this modification the compiler will reject the broken
-\texttt{op\_or} implementation above:
+\code{op\_or} implementation above:
 
 \begin{verbatim}
 Binary operation | cannot be applied to type cpu::RegisterIndex:
@@ -1925,8 +1928,8 @@ Hurray for type safety!
 
 \subsection{CACHE\_CONTROL register}
 
-The BIOS then wants to write \texttt{0x00000804} to
-\texttt{0xfffe0130}. This address is used for cache control. Since we
+The BIOS then wants to write \code{0x00000804} to
+\code{0xfffe0130}. This address is used for cache control. Since we
 won't implement the caches yet we can just add a log message and
 ignore this register for the moment:
 
@@ -1937,7 +1940,7 @@ pub const CACHE_CONTROL: Range = Range(0xfffe0130, 4);
 
 \subsection{The coprocessors}
 
-The next unhandled instruction, \texttt{0x408c6000}, involves one of
+The next unhandled instruction, \code{0x408c6000}, involves one of
 the R3000 CPU coprocessors.
 
 Coprocessors are pieces of hardware which live alongside the CPU and
@@ -1979,9 +1982,9 @@ encountering 3D code.
 
 \subsection{MTC0 instruction}
 
-Back to the \texttt{0x408c6000} instruction: the opcode (bits [31:26])
-is equal to \texttt{0b010000} which means that it's an instruction for
-the coprocessor 0. The generic format is \texttt{0b0100}\emph{nn} where
+Back to the \code{0x408c6000} instruction: the opcode (bits [31:26])
+is equal to \code{0b010000} which means that it's an instruction for
+the coprocessor 0. The generic format is \code{0b0100}\emph{nn} where
 \emph{nn} is the coprocessor number.
 
 \begin{lstlisting}
@@ -2008,10 +2011,10 @@ impl Cpu {
 }
 \end{lstlisting}
 
-\texttt{Instruction::cop\_opcode} returns the same bit range as
-\texttt{Instruction::s}, however it returns it as a plain \texttt{u32}
-instead of a \texttt{RegisterIndex} (since it's not a register in this
-case). You see that the current coprocessor opcode \texttt{0b00100} means
+\code{Instruction::cop\_opcode} returns the same bit range as
+\code{Instruction::s}, however it returns it as a plain \code{u32}
+instead of a \code{RegisterIndex} (since it's not a register in this
+case). You see that the current coprocessor opcode \code{0b00100} means
 MTC0 or ``move to coprocessor 0''. This instruction takes two
 parameters: the source register index (one of the CPU's general
 registers) and the target register (one of the coprocessor's
@@ -2021,25 +2024,25 @@ register). Those parameters are respectively in bits [20:16] and
 In our current instruciton both of those parameters are equal to 12 so
 if we decode the instruction in full it gives\footnote{This is
   actually pseudo-assembly for the sake of clarity. The correct GNU
-  assembler syntax would be \mbox{\texttt{mtc0 \$12, \$12}} but it's a
+  assembler syntax would be \mbox{\code{mtc0 \$12, \$12}} but it's a
 bit too ambiguous for my taste.}:
 
 \begin{lstlisting}[language=assembly]
 mtc0 $12, $cop0_12
 \end{lstlisting}
 
-\texttt{\$cop0\_12} is a very useful register: it's called the
+The coprocessor register \$cop0\_12 is very useful: it's called the
 ``status register'' or SR for short. Among other things it's used to
 query and mask the exceptions and controlling the cache behaviour.
 
-At this point the \$12 register contains \texttt{0x00010000} so this
+At this point the \$12 register contains \code{0x00010000} so this
 MTC0 instruction sets bit 16 of SR which is the ``isolate cache''
 bit. It makes all the following read and write target directly the
 cache instead of going through it towards the main memory. We're
 probably in the middle of the cache initialization sequence.
 
 At any rate since we still haven't implemented anything cache-related
-we'll just store the value of the SR in our \texttt{Cpu} struct and
+we'll just store the value of the SR in our \code{Cpu} struct and
 move along:
 
 \begin{lstlisting}
@@ -2106,7 +2109,7 @@ impl Cpu {
 
 \subsection{BNE instruction}
 
-We now encounter the instruction \texttt{0x154bfff7}. It encodes a
+We now encounter the instruction \code{0x154bfff7}. It encodes a
 BNE or *branch if not equal* instruction. The difference between
 jumps and branches is that branches are *conditional* and they use
 *relative offsets*.
@@ -2167,15 +2170,15 @@ impl Cpu {
 }
 \end{lstlisting}
 
-Notice the \texttt{wrapping\_sub(4)} to compensate for our hardcoded
-\texttt{pc.wrapping\_add(4)} in
-\texttt{run\_next\_instruction}. Without it we'd branch one
+Notice the \code{wrapping\_sub(4)} to compensate for our
+\code{pc.wrapping\_add(4)} in
+\code{run\_next\_instruction}. Without it we'd branch one
 instruction too far.
 
 \subsection{ADDI instruction}
 
 Before we even reach the target of the branch we stumble upon
-unhandled instruction \texttt{0x214a0080}. This one is an ADDI which
+unhandled instruction \code{0x214a0080}. This one is an ADDI which
 behaves exactly like the ADDIU instruction we've already implemented
 except that it generates an exception if the addition overflows.
 
@@ -2185,7 +2188,7 @@ addi $10, $10, 128
 \end{lstlisting}
 
 Since this operation checks for signed overflow I'll cast the operands
-to \texttt{i32} before using the \texttt{checked\_add} provided by
+to \code{i32} before using the \code{checked\_add} provided by
 rust's standard library\footnote{If you're implementing this in C or
   C++ and need to check for signed overflow yourself you'll find
   plenty of examples online. Welcome to the 1970s. Be careful with
@@ -2215,12 +2218,399 @@ impl Cpu {
 }
 \end{lstlisting}
 
-The cast to \texttt{i32} is important because something like
-\texttt{0x4 + 0xffffffff} is an overflow in 32bit unsigned
+The cast to \code{i32} is important because something like
+\code{0x4 + 0xffffffff} is an overflow in 32bit unsigned
 arithmetics. If the operands are signed however it's simply 4 + -1 and
 that's obviously perfectly fine. The actual result of the operation
-would be the same (\texttt{0x00000003}) but since ADDI generates an
+would be the same (\code{0x00000003}) but since ADDI generates an
 exception on overflow the difference in behaviour is critical.
+
+\subsection{Memory loads}
+
+The next unhandled instruction, \code{0x8d090000} is LW or ``load
+word''. It decodes to:
+
+\begin{lstlisting}[language=assembly]
+lw $9, 0($8)
+\end{lstlisting}
+
+We can reuse the \code{load32} method to fetch the data from memory:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Word
+    fn op_lw(&mut self, instruction: Instruction) {
+
+        if self.sr & 0x10000 != 0 {
+            // Cache is isolated, ignore write
+            println!("Ignoring load while cache is isolated");
+            return;
+        }
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        let v = self.load32(addr);
+
+        self.set_reg(t, v);
+    }
+\end{lstlisting}
+
+There's a subtle problem with this implementation however.
+
+\subsection{Load delay slots}
+
+Sounds familiar? It's our friend the pipeline messing with us once
+again. What happens is that the load instructions attempts to read
+from the memory, but that takes time. At least, it takes more than a
+single cycle.
+
+On the R3000 CPU it creates ``load delay slots'': when you load a
+value from memory the CPU will execute the next instruction
+\emph{before} the value is fetched into the target
+register\footnote{This behaviour is part of the MIPS~I
+  architecture. Later revisions (starting with MIPS~II) don't
+  have load delay slots, only branch delay slots.}.
+
+Consider this sequence of instructions:
+
+\begin{lstlisting}[language=assembly]
+lw   $1, 0($zero)  /* Load $1 with the value at address 0 */
+move $2, $1        /* Move $1 in $2 */
+move $3, $1        /* Move $1 in $3 */
+\end{lstlisting}
+
+The first MOVE instruction\footnote{As I mentioned earlier MOVE is
+  actually a pseudo-instruction that the assembler will expand into an
+  \code{addu \$<\emph{target}>, \$<\emph{source}>, \$zero}.} is in
+the load delay slot of the previous LW. That means that at that point
+the register \$1 does not yet contain the value loaded into it. So
+after these two instructions \$2 contains the value of \$1
+\emph{before} the load. The 2nd MOVE however takes place after the
+load delay slot so \$3 will contain the final, post-load value of \$1.
+
+But it gets worse. Consider the value of \$1 after these two
+instructions:
+
+\begin{lstlisting}[language=assembly]
+lw    $1, 0($zero)  /* Load $1 with the value at address 0 */
+addiu $1, $zero, 42 /* Put 42 in $1 */
+\end{lstlisting}
+
+We first use LW to load something in \$1 and then, while the load
+takes place, we change the value of \$1 with an ADDIU instruction. Who
+wins?
+
+You might think that since the LW finishes after the load delay slot
+its fetched value will override the one set by the ADDIU. It turns out
+that it's not the case however: after those two instructions \$1 will
+contain 42, no matter what the LW fetched.
+
+It's a bit of a bad news for us emulator writers. It means we can't
+execute the load before the delay slot because the instruction must
+see the previous value of the loaded register (otherwise the first
+example code above won't work) and we can't just execute it afterwards
+because it would make the load take the priority over the delay slot
+(thus breaking our 2nd example).
+
+One way to see it is that the loaded value ends up in the target
+register \emph{after} the next instruction has fetched the input
+register values but \emph{before} the next instruction updates the
+target register values. In our first example \$1 is an input register
+to both MOVEs while in the 2nd it's the output (destination) register
+of the ADDIU.
+
+We could implement it exactly that way by splitting each instruction
+in two:
+\begin{itemize}
+\item The first part would take the pre-load register values, compute
+  the result (adding \$zero and 10 in the 2nd example example above),
+\item Then it would execute any pending load,
+\item Finally it would store the result of the computation in the
+  target register (\$1 in the ADDIU). That way the ADDIU will write
+  last.
+\end{itemize}
+
+I don't really like this solution however because we'll have to handle
+load delays explicitly in all instructions which seems inelegant and
+error-prone.
+
+Instead I'm going to use two sets of general purpose registers: one
+will be the \emph{input} set and the other the \emph{output} set. Each
+instruction will read its input values from the former set and will
+write to the latter. Once the instruction is finished we copy the
+output set into the input set for the next instruction.
+
+This way we can update the output register set with the load value
+\emph{before} we execute the instruction and it will still see the old
+value from the \emph{input} set. And if the instruction writes to the
+same register it will overwrite the value in the \emph{output} set.
+
+Hopefully it should be clearer in code. First let's add a 2nd set of
+registers and a (register, value) tuple containing the pending load:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    //...
+
+    /// 2nd set of registers used to emulate the load delay slot
+    /// accurately. They contain the output of the current
+    /// instruction.
+    out_regs: [u32; 32],
+    /// Load initiated by the current instruction
+    load: (RegisterIndex, u32),
+}
+
+impl Cpu {
+
+    pub fn new(inter: Interconnect) -> Cpu {
+        //...
+
+        Cpu {
+            //...
+	    out_regs: regs,
+            load: (RegisterIndex(0), 0),
+        }
+    }
+
+    //...
+}
+\end{lstlisting}
+
+If no load is pending we can just target \$zero since it doesn't do
+anything.
+
+Now we can update the \code{set\_reg} method to target the
+\emph{output} register set:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    fn set_reg(&mut self, index: RegisterIndex, val: u32) {
+        self.out_regs[index.0 as usize] = val;
+
+        // Make sure R0 is always 0
+        self.out_regs[0] = 0;
+    }
+}
+\end{lstlisting}
+
+Since all our instructions so far use this helper method to update the
+register values we won't have to modify their code at all.
+
+The next step is to update \code{run\_next\_instruction} to handle
+pending loads and copying the output registers between every
+instructions:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    pub fn run_next_instruction(&mut self) {
+        //...
+
+        // Execute the pending load (if any, otherwise it will load
+        // $zero which is a NOP). `set_reg` works only on
+        // `out_regs` so this operation won't be visible by
+        // the next instruction.
+        let (reg, val) = self.load;
+        self.set_reg(reg, val);
+
+        // We reset the load to target register 0 for the next
+        // instruction
+        self.load = (RegisterIndex(0), 0);
+
+        self.decode_and_execute(instruction);
+
+        // Copy the output registers as input for the
+        // next instruction
+        self.regs = self.out_regs;
+    }
+}
+\end{lstlisting}
+
+You can see that we're copying 128 bytes worth of registers for each
+instruction which might not be great performance-wise but at this
+point I don't really care about that.
+
+\subsection{LW instruction}
+
+We can now write the correct, load-delay friendly implementation of
+SW:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Word
+    fn op_lw(&mut self, instruction: Instruction) {
+
+        if self.sr & 0x10000 != 0 {
+            // Cache is isolated, ignore write
+            println!("Ignoring load while cache is isolated");
+            return;
+        }
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        let v = self.load32(addr);
+
+        // Put the load in the delay slot
+        self.load = (t, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{The RAM}
+
+Unfortunately we can't test our brand new load delay slot just yet
+because the current instruction attemps to load from an unhandled
+address: \code{0xa0000000}. The memory map\ref{tab:mmap} tells us that
+this is the first address in RAM.
+
+Adding RAM support is straightforward: it's very similar to our BIOS
+implementation except it boots up uninitialized and it's not
+read-only:
+
+\begin{lstlisting}
+/// RAM
+pub struct Ram {
+    /// RAM buffer
+    data: Vec<u8>
+}
+
+impl Ram {
+
+    /// Instantiate main RAM with garbage values
+    pub fn new() -> Ram {
+
+        // Default RAM contents are garbage
+        let data = vec![0xca, 2 * 1024 * 1024];
+
+        Ram { data: data }
+    }
+
+    /// Fetch the 32bit little endian word at `offset`
+    pub fn load32(&self, offset: u32) -> u32 {
+        let offset = offset as usize;
+
+        let b0 = self.data[offset + 0] as u32;
+        let b1 = self.data[offset + 1] as u32;
+        let b2 = self.data[offset + 2] as u32;
+        let b3 = self.data[offset + 3] as u32;
+
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    /// Store the 32bit little endian word `val` into `offset`
+    pub fn store32(&mut self, offset: u32, val: u32) {
+        let offset = offset as usize;
+
+        let b0 = val as u8;
+        let b1 = (val >> 8) as u8;
+        let b2 = (val >> 16) as u8;
+        let b3 = (val >> 24) as u8;
+
+        self.data[offset + 0] = b0;
+        self.data[offset + 1] = b1;
+        self.data[offset + 2] = b2;
+        self.data[offset + 3] = b3;
+    }
+
+}
+\end{lstlisting}
+
+I arbitrarily chose `0xca` as the poison value on startup. It's pretty
+strange that the BIOS attempts to fetch data from the RAM before
+writing anything to it (and effectively reading garbage) but if you
+look at the following instructions it repeatedly reads the same
+address (the first word in RAM) and does nothing with it. I'm not sure
+what this code does but it probably initializes something. Let's hope
+it's not too important\ldots{}
+
+\subsection{The coprocessor 0 registers}
+
+After that the BIOS wants to initialize the remaining cop0 registers
+by loading \$zero into them with the MTC0 instruction.
+
+Let's take the time to review those registers:
+
+\begin{itemize}
+\item \$cop0\_3 is BPC, used to generate a breakpoint exception when the
+  PC takes the given value.
+
+\item \$cop0\_5 is BDA, the data breakpoint. It's like BPC except it
+  breaks when a certain address is accessed on a data load/store instead
+  of a PC value.
+
+\item \$cop0\_6: I couldn't find a lot of informations on this
+  register or what it does, the consensus seems to be that it's
+  basically useless.
+
+\item \$cop0\_7 is DCIC, used to enable and disable the various
+  hardware breakpoints.
+
+\item \$cop0\_9 is BDAM, it's a bitmask applied when testing for BDA
+  above. That way we could trigger on a range of address instead of a
+  single one.
+
+\item \$cop0\_11 is BPCM, like BDAM but for masking the BPC
+  breakpoint.
+
+\item \$cop0\_12 we've already encountered: it's SR, the status register.
+
+\item \$cop0\_13 is CAUSE, which contains mostly read-only data
+  describing the cause of an exception. Apparently only bits [9:8] are
+  writable to force an exception.
+\end{itemize}
+
+You can see that most of those registers (except SR and CAUSE) deal
+with hardware breakpoints. That's generally used for debugging so we
+shouldn't need to emulate those for most games. It's probably safe to
+ignore for now. You can see that the BIOS loads \$zero into all of
+them which disables them.
+
+For now we're just going to ignore write to these registers when the
+value is 0. If at some point some game writes something else we'll
+catch it and see what we need to implement:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Move To Coprocessor 0
+    fn op_mtc0(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = self.reg(cpu_r);
+
+        match cop_r {
+            3 | 5 | 6 | 7 | 9 | 11  => // Breakpoints registers
+                if v != 0 {
+                    panic!("Unhandled write to cop0r{}", cop_r)
+                },
+            12 => self.sr = v,
+            13 => // Cause register
+                if v != 0 {
+                    panic!("Unhandled write to CAUSE register.")
+                },
+            _  => panic!("Unhandled cop0 register {}", cop_r),
+        }
+    }
+}
+\end{lstlisting}
 
 \newpage
 
