@@ -2110,7 +2110,7 @@ impl Cpu {
 \subsection{BNE instruction}
 
 We now encounter the instruction \code{0x154bfff7}. It encodes a
-BNE or *branch if not equal* instruction. The difference between
+BNE or ``branch if not equal'' instruction. The difference between
 jumps and branches is that branches are *conditional* and they use
 *relative offsets*.
 
@@ -2259,6 +2259,7 @@ impl Cpu {
 
         self.set_reg(t, v);
     }
+}
 \end{lstlisting}
 
 There's a subtle problem with this implementation however.
@@ -2474,6 +2475,8 @@ impl Cpu {
 
 \subsection{The RAM}
 
+\label{sec:ram}
+
 Unfortunately we can't test our brand new load delay slot just yet
 because the current instruction attemps to load from an unhandled
 address: \code{0xa0000000}. The memory map\ref{tab:mmap} tells us that
@@ -2527,17 +2530,22 @@ impl Ram {
         self.data[offset + 2] = b2;
         self.data[offset + 3] = b3;
     }
-
 }
 \end{lstlisting}
 
-I arbitrarily chose `0xca` as the poison value on startup. It's pretty
+I arbitrarily chose \code{0xca} as the poison value on startup. It's pretty
 strange that the BIOS attempts to fetch data from the RAM before
 writing anything to it (and effectively reading garbage) but if you
 look at the following instructions it repeatedly reads the same
 address (the first word in RAM) and does nothing with it. I'm not sure
 what this code does but it probably initializes something. Let's hope
 it's not too important\ldots{}
+
+We can then plug our brand new RAM in the interconnect as usual:
+
+\begin{lstlisting}
+pub const RAM: Range = Range(0xa0000000, 2 * 1024 * 1024);
+\end{lstlisting}
 
 \subsection{The coprocessor 0 registers}
 
@@ -2610,6 +2618,189 @@ impl Cpu {
         }
     }
 }
+\end{lstlisting}
+
+\subsection{SLTU instruction}
+
+After that we encounter the instruction \code{0x0043082b} which
+encodes the ``set on less than unsigned''(STLU) opcode:
+
+\begin{lstlisting}[language=assembly]
+sltu $1, $2, $3
+\end{lstlisting}
+
+This instruction compares the value of two registers (\$2 and \$3 in
+this case) and sets the value of a third one (\$1) to either 0 or 1
+depending on the result of the ``less than'' comparison:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Set on Less Than Unsigned
+    fn op_sltu(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = self.reg(s) < self.reg(t);
+
+        self.set_reg(d, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{ADDU instruction}
+
+We then stumble upon the instruction \code{0x03a0f021} which encodes
+an ``Add unsigned'' (ADDU) opcode:
+
+\begin{lstlisting}[language=assembly]
+addu $30, $29, $zero
+\end{lstlisting}
+
+You can see that with \$zero as the third operand it simply moves \$29
+in \$30, so in this case it's really a MOVE instruction.
+
+The instruction is implemented like ADDIU except that we add two
+registers instead of a register and an immediate value:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Add Unsigned
+    fn op_addu(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let v = self.reg(s).wrapping_add(self.reg(t));
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{Regions}
+
+Our next problem is an unhandled access at address
+\code{0x00000060}. If we look at the memory map\ref{tab:mmap} we see
+  that it's the RAM. But we've already added the RAM in our
+  interconnect in section~\ref{sec:ram}!
+
+The problem is that currently we mapped the RAM at \code{0xa0000000},
+in the KSEG1 region. But this time the BIOS attempts to access it
+through an other region: KUSEG. We could add multiple mappings for
+each peripheral in each region but that would be a waste of code and
+performance.
+
+Let's a closer look at how those regions are specified by the MIPS
+architecture:
+
+\begin{itemize}
+\item KSEG0 starts at \code{0x80000000} and ends at
+  \code{0x9fffffff}. This region is accessed through the caches but
+  it's not mapped through the
+  \href{https://en.wikipedia.org/wiki/Memory_management_unit}{MMU}. In
+  order to get the physical address we just have to strip the MSB.
+
+\item KSEG1 starts at \code{0xa0000000} and ends at
+  \code{0xbfffffff}. This region is not cached or mapped through the
+  MMU. In order to get the physical address we just have to strip the
+  three MSBs.
+
+\item KSEG2 starts at \code{0xc0000000} and ends at
+  \code{0xffffffff}. This region is only accessed in kernel mode and
+  is also cached and goes through the MMU.
+
+\item KUSEG starts at \code{0x00000000} and ends at
+  \code{0x7fffffff}. It's meant for user code and is both cached and
+  goes through the MMU.
+\end{itemize}
+
+All that sounds rather complicated. Fortunately for us since we're
+targeting the Playstation and not some generic MIPS architecture we'll
+be able to make some simplifications:
+
+\begin{itemize}
+\item The Playstation hardware does not have a MMU and therefore no
+  virtual memory. We won't have to deal with memory translation.
+
+\item The Playstation CPU has 1KB of data cache and an other kilobyte
+  of instruction cache. However the data cache is not used, instead
+  its memory is mapped as the "scratpad" at a fixed location. In other
+  word we don't need to implement the data cache.
+
+\item As far as I can tell the Playstation software doesn't seem to
+  use the kernel/user privilege separation and runs everything in
+  kernel mode.
+\end{itemize}
+
+In other words the only time we'll need to worry about which region is
+in use is when we'll implement the cache instruction and only for
+KSEG1 since that's the only non-cached region.. For everything else it
+doesn't matter through which region the peripherals are accessed.
+
+In order to solve our issue of having multiple mappings at different
+addresses for the same peripherals in different regions we want to
+compute the unique physical address corresponding to a memory access
+and map that through our interconnect code.
+
+By the descriptions above you see that we should mask a different
+number of bits depending on the region. Since KSEG2 doesn't share
+anything with the other regions we won't touch the address here
+(otherwise we would allow access to the RAM through KSEG2 for instance
+and that wouldn't be accurate). In order to avoid branches we can use
+a nice mask lookup table:
+
+\begin{lstlisting}
+/// Mask array used to strip the region bits of the address. The
+/// mask is selected using the 3 MSBs of the address so each entry
+/// effectively matches 512kB of the address space. KSEG2 is not
+/// touched since it doesn't share anything with the other
+/// regions.
+const REGION_MASK: [u32; 8] = [
+    // KUSEG: 2048MB
+    0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+    // KSEG0:  512MB
+    0x7fffffff,
+    // KSEG1:  512MB
+    0x1fffffff,
+    // KSEG2: 1024MB
+    0xffffffff, 0xffffffff,
+];
+
+/// Mask a CPU address to remove the region bits.
+pub fn mask_region(addr: u32) -> u32 {
+    // Index address space in 512MB chunks
+    let index = (addr >> 29) as usize;
+
+    addr & REGION_MASK[index]
+}
+\end{lstlisting}
+
+We can now use this \code{mask\_region} function in our interconnect's
+load and store functions to convert any address coming from the CPU
+into a unique physical address used to identify the target peripheral.
+
+We also have to change all our current address map declarations to use
+physical addresses:
+
+\begin{lstlisting}
+pub const RAM: Range = Range(0x00000000, 2 * 1024 * 1024);
+
+pub const BIOS: Range = Range(0x1fc00000, 512 * 1024);
+
+/// Unknown registers. The name comes from mednafen.
+pub const SYS_CONTROL: Range = Range(0x1f801000, 36);
+
+/// Register that has something to do with RAM configuration,
+/// configured by the BIOS
+pub const RAM_SIZE: Range = Range(0x1f801060, 4);
+
+/// Cache control register. Full address since it's in KSEG2
+pub const CACHE_CONTROL: Range = Range(0xfffe0130, 4);
 \end{lstlisting}
 
 \newpage
