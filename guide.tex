@@ -28,10 +28,11 @@
 
 \lstdefinelanguage{assembly}%
   {
-   morekeywords={nop,lui,move,addu,addiu,addi,j,jal,sll,%
-                 sw,sh,sb,or,ori,%
+    morekeywords={nop,lui,move,addu,addiu,addi,j,jal,jr,%
+                 sll,%
+                 sw,sh,sb,or,ori,and,andi,%
                  mtc0,mtc1,mtc2,mtc3,%
-                 li,lw,%
+                 li,lw,lh,lhu,lb,lbu%
                  bne,%
                  },%
    sensitive,%
@@ -201,7 +202,7 @@ By using a register of course!
 very small and very fast special purpose memories built inside the
 CPU. Most CPU instructions manipulate those registers by adding them,
 multiplying them, masking them, storing their content to memory or
-fetching it back\ldots{}
+fetching it back\dots{}
 
 \href{https://en.wikipedia.org/wiki/Program_counter}{The Program
   Counter} (henceforth refered to as PC) is one of the most
@@ -342,7 +343,7 @@ impl Cpu {
 Our CPU treats all addresses the same way but at some point we'll have
 to dispatch the load/store requests to the correct peripheral. If we
 read the BIOS and we get GPU data instead we're going to run into
-troubles very quickly\ldots{}
+troubles very quickly\dots{}
 
 So how do we know what is mapped at some arbitrary address? By using
 the \href{https://en.wikipedia.org/wiki/Memory_map}{memory map} of
@@ -901,26 +902,26 @@ instruction is 5bits, that means it can index 32 registers. But for
 now we only have one register in our CPU: the PC. We need to
 introduce the rest of them.
 
-\subsection{CPU general purpose registers}
+\subsection{General purpose registers}
 
 \begin{table}[ht]
   \centering
 
   \begin{tabular}{ l | l | l }
-    Number      & Name        & Conventional use          \\
+    Register         & Name             & Conventional use          \\
     \hline
-    \$0         & \$zero      & Always zero               \\
-    \$1         & \$at        & Assembler temporary       \\
-    \$2, \$3    & \$v0, \$v1  & Function return values    \\
-    \$4...\$7   & \$a0...\$a3 & Function arguments        \\
-    \$8...\$15  & \$t0...\$t7 & Temporary registers       \\
-    \$16...\$23 & \$s0...\$s7 & Saved registers           \\
-    \$24...\$25 & \$t8...\$t9 & Temporary registers       \\
-    \$26...\$27 & \$k0...\$k1 & Kernel reserved registers \\
-    \$28        & \$gp        & Global pointer            \\
-    \$29        & \$sp        & Stack pointer             \\
-    \$30        & \$fp        & Frame pointer             \\
-    \$31        & \$ra        & Function return address   \\
+    \$0              & \$zero           & Always zero               \\
+    \$1              & \$at             & Assembler temporary       \\
+    \$2, \$3         & \$v0, \$v1       & Function return values    \\
+    \$4\dots{}\$7    & \$a0\dots{}\$a3  & Function arguments        \\
+    \$8\dots{}\$15   & \$t0\dots{}\$t7  & Temporary registers       \\
+    \$16\dots{}\$23  & \$s0\dots{}\$s7  & Saved registers           \\
+    \$24, \$25       & \$t8, \$t9       & Temporary registers       \\
+    \$26, \$27       & \$k0, \$k1       & Kernel reserved registers \\
+    \$28             & \$gp             & Global pointer            \\
+    \$29             & \$sp             & Stack pointer             \\
+    \$30             & \$fp             & Frame pointer             \\
+    \$31             & \$ra             & Function return address   \\
   \end{tabular}
 
   \caption{R3000 CPU general purpose registers}
@@ -996,7 +997,7 @@ emulator (with the exception of \$zero and \$ra) but it's still useful
 to know the convention when trying to understand what some emulated
 code is doing.
 
-\subsection{CPU special purpose registers}
+\subsection{Special purpose registers}
 
 \begin{table}[ht]
   \centering
@@ -1598,7 +1599,7 @@ idea...
 
 Knowing that it's easy to implement it in our emulator\footnote{I'll
   skip the code in \code{decode\_and\_execute} from now on, I'm sure
-  you can figure it out by yourself\ldots{}}:
+  you can figure it out by yourself\dots{}}:
 
 \begin{lstlisting}
 impl Cpu {
@@ -2127,7 +2128,7 @@ In other words the instruction will compare the values in \$10 and
 PC. If the values are equal it'll do absolutely nothing.
 
 Like jumps, branches have a delay slot\footnote{It is called a
-  \emph{branch} delay slot after all\ldots}. Fortunately our
+  \emph{branch} delay slot after all\dots}. Fortunately our
 implementation in section~\ref{sec:bds} already takes care of that
 without any more work.
 
@@ -2539,7 +2540,7 @@ writing anything to it (and effectively reading garbage) but if you
 look at the following instructions it repeatedly reads the same
 address (the first word in RAM) and does nothing with it. I'm not sure
 what this code does but it probably initializes something. Let's hope
-it's not too important\ldots{}
+it's not too important\dots{}
 
 We can then plug our brand new RAM in the interconnect as usual:
 
@@ -2801,6 +2802,474 @@ pub const RAM_SIZE: Range = Range(0x1f801060, 4);
 
 /// Cache control register. Full address since it's in KSEG2
 pub const CACHE_CONTROL: Range = Range(0xfffe0130, 4);
+\end{lstlisting}
+
+\subsection{LH instruction}
+
+The next unhandled instruction is \code{0xa5200180} which encodes
+``store halfword'' (SH). It's used to write 16bits (a halfword) to the
+memory:
+
+\begin{lstlisting}[language=assembly]
+sh $zero, 0x180($9)
+\end{lstlisting}
+
+The implementation is very similar to the ``store word'' instruction
+except we truncate the register to 16bits and we'll have to implement
+a new \code{store16} method on our interconnect\footnote{Having
+  separate functions for various width should make the code easier to
+  follow for now but it does create some code duplication, later on
+  I'll use generics to factor them in a single function.}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Store 16bit value into the memory
+    fn store16(&mut self, addr: u32, val: u16) {
+        self.inter.store16(addr, val);
+    }
+
+    /// Store Halfword
+    fn op_sh(&mut self, instruction: Instruction) {
+
+        if self.sr & 0x10000 != 0 {
+            // Cache is isolated, ignore write
+            println!("Ignoring store while cache is isolated");
+            return;
+        }
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+        let v    = self.reg(t);
+
+        self.store16(addr, v as u16);
+    }
+}
+\end{lstlisting}
+
+And in the interconnect:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 16bit halfword `val` into `addr`
+    pub fn store16(&mut self, addr: u32, val: u16) {
+
+        if addr % 2 != 0 {
+            panic!("Unaligned store16 address: {:08x}", addr);
+        }
+
+        panic!("unhandled store16 into address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+
+I start with an empty function instead of copying the \code{store32}
+code because different devices react differently when we change the
+transaction width. Some will pad the value to 32bits with zeroes,
+others may just set 16bits in the register and leave the others
+untouched. For this reason I'll be conservative and add them only when
+needed.
+
+\subsection{SPU registers}
+
+If we run that code we see that this \code{store16} attempts to store
+0 at \code{0x1f801d80}. Looking at the memory map we see it's the
+address of a sound processing unit~(SPU) hardware register. At that
+point we don't really care for sound so we're going to ignore writes
+to these addresses for the time being:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 16bit halfword `val` into `addr`
+    pub fn store16(&mut self, addr: u32, _: u16) {
+
+        if addr % 2 != 0 {
+            panic!("Unaligned store16 address: {:08x}", addr);
+        }
+
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::SPU.contains(abs_addr) {
+            println!("Unhandled write to SPU register {:x}", offset);
+            return;
+        }
+
+        panic!("unhandled store16 into address {:08x}", addr);
+    }
+}
+
+/// SPU registers
+pub const SPU: Range = Range(0x1f801c00, 640);
+\end{lstlisting}
+
+\subsection{JAL instruction}
+
+The next unhandled instruction should be \code{0x0ff00698} which is a
+``jump and link'' (JAL). It behaves like the regular jump instruction
+except that it also stores the return address in \$ra (\$31):
+
+\begin{lstlisting}[language=assembly]
+jal 0xfc01a60
+\end{lstlisting}
+
+Using this instruction it's easy to implement function calls: the
+instruction is called with JAL and can return to the caller by jumping
+to the value in \$ra. Then the control returns to the calling
+function. The \$ra register is the \emph{link} between the caller and
+the callee.
+
+We can reuse the regular J opcode implementation and simply add the
+code to store the return value in \$31:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Jump And Link
+    fn op_jal(&mut self, instruction: Instruction) {
+        let ra = self.pc;
+
+        // Store return address in $31 ($ra)
+        self.set_reg(RegisterIndex(31), ra);
+
+        self.op_j(instruction);
+    }
+}
+\end{lstlisting}
+
+\subsection{ANDI instruction}
+
+We continue with instruction \code{0x308400ff} which is a ``bitwise
+and immediate'' (ANDI):
+
+\begin{lstlisting}[language=assembly]
+andi $4, $4, 0xff
+\end{lstlisting}
+
+We can simply copy the implementation of ORI and replace the \code{|}
+with an \code{\&}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Bitwise And Immediate
+    fn op_andi(&mut self, instruction: Instruction) {
+        let i = instruction.imm();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let v = self.reg(s) & i;
+
+        self.set_reg(t, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{SB instruction}
+
+After the word and halfword store instructions we now meet
+\code{0xa1c42041} which is a ``store byte'' (SB) instruction. We have
+to implement a third path for accessing the memory like we did for
+\code{store32} and \code{store32}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Store 16bit value into the memory
+    fn store8(&mut self, addr: u32, val: u8) {
+        self.inter.store8(addr, val);
+    }
+
+    /// Store Byte
+    fn op_sb(&mut self, instruction: Instruction) {
+
+        if self.sr & 0x10000 != 0 {
+            // Cache is isolated, ignore write
+            println!("Ignoring store while cache is isolated");
+            return;
+        }
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+        let v    = self.reg(t);
+
+        self.store8(addr, v as u8);
+    }
+}
+\end{lstlisting}
+
+\subsection{Expansion 2}
+
+The address being written to is \code{0x1f802041} which falls in the
+expansion 2 memory map. As far as I can tell this expansion is only
+used for debugging on development boards and doesn't do anything
+useful on real hardware. Therefore we'll just ignore writes to this
+expansion:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store byte `val` into `addr`
+    pub fn store8(&mut self, addr: u32, _: u8) {
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::EXPANSION_2.contains(abs_addr) {
+            println!("Unhandled write to expansion 2 register {:x}", offset);
+            return;
+        }
+
+        panic!("unhandled store8 into address {:08x}", addr);
+    }
+}
+
+/// Expansion region 2
+pub const EXPANSION_2: Range = Range(0x1f802000, 66);
+\end{lstlisting}
+
+\subsection{JR instruction}
+
+A few steps later we encounter \code{0x03e00008} which is the ``jump
+register'' (JR) instruction. It simply sets the PC to the value stored
+in one of the general purpose registers:
+
+\begin{lstlisting}[language=assembly]
+jr $31
+\end{lstlisting}
+
+Since JAL stores the return address in \$31 we can return from a
+subroutine by calling \code{jr \$ra} which is exactly what the BIOS
+is doing here.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Jump Register
+    fn op_jr(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+
+        self.pc = self.reg(s);
+    }
+}
+\end{lstlisting}
+
+\subsection{LB instruction}
+
+The next unhandled instruction is \code{0x81efe288} which encodes
+``load byte'' (LB). As you can guess it's like LW except that it only
+loads 8bits from the memory\footnote{Note the use of a negative
+  offset, if we hadn't implemented proper sign extension earlier this
+  instruction would misbehave.}:
+
+\begin{lstlisting}[language=assembly]
+lb $15, -7544($15)
+\end{lstlisting}
+
+Since the general purpose registers are always 32bit LB only loads the
+low 8bits of the register. The byte is treated like a signed value so
+it's sign extended to the full 32bits. Of course like LW there's a
+load delay of one instruction. We can implement it like
+this\footnote{Note the cast from \code{u8} to \code{i8} and finally
+  \code{u32} to force the sign extension.}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load 8bit value from the memory
+    fn load8(&self, addr: u32) -> u8 {
+        self.inter.load8(addr)
+    }
+
+    /// Load Byte (signed)
+    fn op_lb(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        // Cast as i8 to force sign extension
+        let v = self.load8(addr) as i8;
+
+        // Put the load in the delay slot
+        self.load = (t, v as u32);
+    }
+}
+\end{lstlisting}
+
+Next is the \code{Interconnect} implementation. The current
+instruction attempts to load from an address within the BIOS so we'll
+add support for it:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load byte at `addr`
+    pub fn load8(&self, addr: u32) -> u8 {
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::BIOS.contains(abs_addr) {
+            return self.bios.load8(offset);
+        }
+
+        panic!("unhandled load8 at address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+And the implementation of \code{load8} in the BIOS:
+
+\begin{lstlisting}
+impl Bios {
+    //...
+
+    /// Fetch byte at `offset`
+    pub fn load8(&self, offset: u32) -> u8 {
+        self.data[offset as usize]
+    }
+}
+\end{lstlisting}
+
+\subsection{BEQ instruction}
+
+We then get a new branch instruction: \code{0x11e0000c} is ``branch if
+equal'' (BEQ):
+
+\begin{lstlisting}[language=assembly]
+beq $15, $zero, 48
+\end{lstlisting}
+
+We can reuse the code of BNE by changing the condition:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Branch if Equal
+    fn op_beq(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        if self.reg(s) == self.reg(t) {
+            self.branch(i);
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{Expansion 1}
+
+After that the BIOS attemps to read a byte at \code{0x1f000084}. This
+is where the first expansion port is mapped. This expansion goes to
+the parallel port on the back of the early Playstation models.
+
+If you look at the byte read by the first LB instruction above you'll
+see it's the first byte in a C-string: ``\textit{Licensed by Sony
+  Computer Entertainment Inc}''. Apparently in order to detect and
+validate the expansion the BIOS compares this hardcoded string with
+the values stored starting at offset 0x84 in the expansion.
+
+We don't really have any reason to implement an expansion at that
+point so we'll return the default value when no expansion is
+present. Looking at mednafen's source code it seems to be
+full-ones\footnote{I'm actually not sure how to test that easily since
+  I need to have an expansion plugged in the parallel connector to be
+  able to run code on my console. Maybe I could start the code and
+  unplug it but that doesn't sound too great\dots{} A better way
+  would be to burn the test code on a CD and run it on a modchipped
+  console.}:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load byte at `addr`
+    pub fn load8(&self, addr: u32) -> u8 {
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::BIOS.contains(abs_addr) {
+            return self.bios.load8(offset);
+        }
+
+        if let Some(_) = map::EXPANSION_1.contains(abs_addr) {
+            // No expansion implemented
+            return 0xff;
+        }
+
+        panic!("unhandled load8 at address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+\subsection{RAM byte access}
+
+Now the BIOS wants to store a byte to the RAM but we haven't
+implemented that yet, let's fix that by implementing \code{store8} and
+let's add \code{load8} while we're at it:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store byte `val` into `addr`
+    pub fn store8(&mut self, addr: u32, val: u8) {
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::RAM.contains(abs_addr) {
+            return self.ram.store8(offset, val);
+        }
+
+	//...
+    }
+
+    /// Load byte at `addr`
+    pub fn load8(&self, addr: u32) -> u8 {
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::RAM.contains(abs_addr) {
+            return self.ram.load8(offset);
+        }
+
+        //....
+    }
+}
+\end{lstlisting}
+
+And then in the RAM implementation:
+
+\begin{lstlisting}
+impl Ram {
+    //...
+
+    /// Store the byte `val` into `offset`
+    pub fn store8(&mut self, offset: u32, val: u8) {
+        self.data[offset as usize] = val;
+    }
+
+    /// Fetch the byte at `offset`
+    pub fn load8(&self, offset: u32) -> u8 {
+        self.data[offset as usize]
+    }
+}
 \end{lstlisting}
 
 \newpage
