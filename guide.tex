@@ -3,6 +3,7 @@
 \usepackage{hyperref}
 \usepackage{listings}
 \usepackage{color}
+\usepackage{microtype}
 
 \lstdefinelanguage{Rust}%
   {
@@ -29,14 +30,15 @@
   {
     morekeywords={nop,lui,move,%
                  j,jal,jr,jalr,%
-                 add,addu,addiu,addi,%
-                 sll,%
+                 add,addu,addiu,addi,subu,%
+                 sll,sra,srl,sltu,slti,%
                  sw,sh,sb,or,ori,and,andi,%
                  mtc0,mtc1,mtc2,mtc3,%
                  mfc0,mfc1,mfc2,mfc3,%
                  li,lw,lh,lhu,lb,lbu,%
                  beq,bne,bgtz,blez,%
                  bltz, bltzal, bgez, bgezal,%
+                 div,divu,mul,
                  },%
    sensitive,%
    moredelim=[s]{::}{::},%
@@ -1336,14 +1338,12 @@ impl Interconnect {
                         panic!("Bad expansion 2 base address: 0x{:08x}", val);
                     },
                 _ =>
-                    println!("Unhandled write to MEM_CONTROL register {:x}: \
-                              0x{:08x}",
-                             offset, val),
+                    println!("Unhandled write to MEM_CONTROL register"),
             }
             return;
         }
 
-	panic!("unhandled store32 into address {:08x}", addr);
+        panic!("unhandled store32 into address {:08x}", addr);
     }
 }
 \end{lstlisting}
@@ -3654,6 +3654,233 @@ impl Cpu {
 
 Instead of testing bit 16 directly I save a branch by xoring the value
 of \code{test} (which is a boolean 0 or 1) with it.
+
+\subsection{SLTI instruction}
+
+We then encounter \code{0x28810010} which encodes instruction ``set if
+less than immediate'' (SLTI):
+
+\begin{lstlisting}[language=assembly]
+slti $1, $4, 16
+\end{lstlisting}
+
+It works like SLTU except that it compares a register with an
+immediate value (sign-extended) and the comparison is done using
+signed arithmetics:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Set if Less Than Immediate (signed)
+    fn op_slti(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se() as i32;
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = (self.reg(s) as i32) < i;
+
+        self.set_reg(t, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{SUBU instruction}
+
+The next unhandled instruction is \code{0x01c47023} which encodes
+``substract unsigned'' (SUBU):
+
+\begin{lstlisting}[language=assembly]
+subu $14, $14, $4
+\end{lstlisting}
+
+The implementation is straightforward:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Substract Unsigned
+    fn op_subu(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let v = self.reg(s).wrapping_sub(self.reg(t));
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{SRA instruction}
+
+Next we meet instruction \code{0x00042603} which is ``shift right
+arithmetic'' (SRA):
+
+\begin{lstlisting}[language=assembly]
+sra $4, $4, 24
+\end{lstlisting}
+
+There are two versions of the shift right instruction: arithmetic and
+logical. The arithmetic version considers that the value is signed and
+use the sign bit to fill the missing MSBs in the register after the
+shift.
+
+In Rust, C and C++ we can achieve the same behavior by casting the
+register value to a signed integer before doing the shift:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Shift Right Arithmetic
+    fn op_sra(&mut self, instruction: Instruction) {
+        let i = instruction.shift();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let v = (self.reg(t) as i32) >> i;
+
+        self.set_reg(d, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{DIV instruction}
+
+The next unhandled instruction is \code{0x0061001a} which is
+``divide'' (DIV):
+
+\begin{lstlisting}[language=assembly]
+div $3, $1
+\end{lstlisting}
+
+Multiplications and divisions are a bit peculiar on the MIPS
+architecture: for one, the result is not stored in general purpose
+registers but in two dedicated 32bit registers: HI and LO.
+
+For a division LO will contain the quotient and HI the remainder of
+the euclidean division.
+
+The reason for this is that divisions and multiplications are
+typically much slower than the other instructions we've implemented so
+far (with the exception of loads and stores potentially, due to the
+memory latency). While a simple ADD or SRA can be executed in a single
+CPU cycle, DIV can take as much as 36 cycles to get the result.
+
+In order to try and hide this delay when the CPU executes a division
+instruction it does not stall the pipeline waiting for the instruction
+to finish. Rather it continues executing the following instructions
+and when the code decides to fetch the result of the division (using
+dedicated instructions to load HI or LO) the CPU only stalls if it
+didn't have the time to finish doing the division in the
+background. This way if you craft your assembly cleverly you can hide
+the division delay by doing some other work while the division is
+finishing.
+
+For now we haven't bothered implementing accurate timings at all so we
+won't worry about these details and consider the division takes one
+cycle to execute. Later on when we implement proper timings we'll have
+to revisit that code.
+
+\begin{table}[ht]
+  \centering
+
+  \begin{tabular}{ l | l | l | l }
+    Numerator         & Denominator       & Quotient (LO)
+    & Remainder (HI)\\
+    \hline
+    $ \ge 0 $         & 0                 & -1 (\code{0xffffffff})
+    & \textit{numerator} \\
+    $ < 0 $           & 0                 & +1
+    & \textit{numerator} \\
+    \code{0x80000000} & \code{0xffffffff} & \code{0x80000000}
+    & 0 \\
+  \end{tabular}
+
+  \caption{Special cases in divisions}
+  \label{tab:divspecial}
+\end{table}
+
+An important thing to consider is what happens when we encounter a
+division by zero. Perhaps surprisingly the CPU does not generate an
+exception, it just gives bogus values (1 or -1 depending on the
+sign of the dividend).
+
+An other bogus behaviour would be to divide \code{0x80000000}
+(-2147483648) by \code{0xffffffff} (-1) which would yield 2147483648
+which does not fit in a 32bit signed
+integer. Table~\ref{tab:divspecial} gives a summary of those special
+cases.
+
+We should now have all we need to implement the instruction, let's
+start by adding the HI and LO registers to our \code{Cpu}:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    //...
+
+    /// HI register for division remainder and multiplication high
+    /// result
+    hi: u32,
+    /// LO register for division quotient and multiplication low
+    /// result
+    lo: u32,
+}
+
+impl Cpu {
+
+    pub fn new(inter: Interconnect) -> Cpu {
+        //...
+
+        Cpu {
+	    //...
+            hi: 0xdeadbeef,
+            lo: 0xdeadbeef,
+        }
+    }
+
+    //...
+}
+\end{lstlisting}
+
+And now the implementation of the DIV opcode itself:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Divide (signed)
+    fn op_div(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let n = self.reg(s) as i32;
+        let d = self.reg(t) as i32;
+
+        if d == 0 {
+            // Division by zero, results are bogus
+            self.hi = n as u32;
+
+            if n >= 0 {
+                self.lo = 0xffffffff;
+            } else {
+                self.lo = 1;
+            }
+        } else if n as u32 == 0x80000000 && d == -1 {
+            // Result is not representable in a 32bit
+            // signed integer
+            self.hi = 0;
+            self.lo = 0x80000000;
+        } else {
+            self.hi = (n % d) as u32;
+            self.lo = (n / d) as u32;
+        }
+    }
+}
+\end{lstlisting}
 
 \newpage
 
