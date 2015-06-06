@@ -19,7 +19,6 @@
                  while,yield},%
    sensitive,%
    morekeywords=[1]{\$},%
-   moredelim=[s][keywordstyle3]{::}{::},%
    morecomment=[s]{/*}{*/},%
    morecomment=[l]//,%
    morestring=[b]",%
@@ -28,12 +27,16 @@
 
 \lstdefinelanguage{assembly}%
   {
-    morekeywords={nop,lui,move,addu,addiu,addi,j,jal,jr,%
+    morekeywords={nop,lui,move,%
+                 j,jal,jr,jalr,%
+                 add,addu,addiu,addi,%
                  sll,%
                  sw,sh,sb,or,ori,and,andi,%
                  mtc0,mtc1,mtc2,mtc3,%
-                 li,lw,lh,lhu,lb,lbu%
-                 bne,%
+                 mfc0,mfc1,mfc2,mfc3,%
+                 li,lw,lh,lhu,lb,lbu,%
+                 beq,bne,bgtz,blez,%
+                 bltz, bltzal, bgez, bgezal,%
                  },%
    sensitive,%
    moredelim=[s]{::}{::},%
@@ -2110,10 +2113,10 @@ impl Cpu {
 
 \subsection{BNE instruction}
 
-We now encounter the instruction \code{0x154bfff7}. It encodes a
-BNE or ``branch if not equal'' instruction. The difference between
-jumps and branches is that branches are *conditional* and they use
-*relative offsets*.
+We now encounter the instruction \code{0x154bfff7}. It encodes a BNE
+or ``branch if not equal'' instruction. The difference between jumps
+and branches is that branches are \emph{conditional} and they use
+\emph{relative offsets}.
 
 The immediate value is sign extended (in order to allow for negative
 offsets) and multiplied by 4 (as always, the PC must be aligned to
@@ -3154,7 +3157,7 @@ We then get a new branch instruction: \code{0x11e0000c} is ``branch if
 equal'' (BEQ):
 
 \begin{lstlisting}[language=assembly]
-beq $15, $zero, 48
+beq $15, $zero, +48
 \end{lstlisting}
 
 We can reuse the code of BNE by changing the condition:
@@ -3271,6 +3274,386 @@ impl Ram {
     }
 }
 \end{lstlisting}
+
+\subsection{MFC0 instruction}
+
+We've already met MTC0, now we encounter the reciprocal instruction:
+\code{0x40026000} encodes ``move from coprocessor 0''
+(MFC0)\footnote{I'm using peudo-assembly again. The proper GNU
+  assembler syntax would be \code{mfc0~\$2,~\$12}}:
+
+\begin{lstlisting}[language=assembly]
+mfc0 $2, $cop0_12
+\end{lstlisting}
+
+There's one important thing to note however: MFC instructions behave
+like memory loads and have a delay slot before the value is finally
+stored in the target register.
+
+Fortunately we can simply re-use our load delay slots infrastructure:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Move From Coprocessor 0
+    fn op_mfc0(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = match cop_r {
+            12 => self.sr,
+            13 => // Cause register
+                panic!("Unhandled read from CAUSE register"),
+            _  =>
+                panic!("Unhandled read from cop0r{}", cop_r),
+        };
+
+        self.load = (cpu_r, v)
+    }
+}
+\end{lstlisting}
+
+\subsection{AND instruction}
+
+An other easy instruction follows a few cycles later:
+\code{0x00412024} which is a ``bitwise and'' (AND):
+
+\begin{lstlisting}[language=assembly]
+and $4, $2, $1
+\end{lstlisting}
+
+We've already implemented OR so we can reuse the code, only changing
+the operator:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Bitwise And
+    fn op_and(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = self.reg(s) & self.reg(t);
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{ADD instruction}
+
+We already implemented ADDIU, ADDI and ADDU. We finally encounter
+``add'' (ADD) in instruction \code{0x01094020}:
+
+\begin{lstlisting}[language=assembly]
+add $8, $8, $9
+\end{lstlisting}
+
+It adds the value of two registers (like ADDU) but generates an
+exception on signed overflow (like ADDI):
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Add and generate an exception on overflow
+    fn op_add(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let s = self.reg(s) as i32;
+        let t = self.reg(t) as i32;
+
+        let v = match s.checked_add(t) {
+            Some(v) => v as u32,
+            None    => panic!("ADD overflow"),
+        };
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{Interrupt Control registers}
+
+The BIOS then attempts to write 0 at address
+\code{0x1f801074}. Looking at the memory map this is the ``Interrupt
+Mask'' register.
+
+This register is used to activate or ignore external
+\href{https://en.wikipedia.org/wiki/Interrupt}{interrupt signals}
+(things like blanking interrupts from the GPU, timers, controller and
+memory card interrupts etc\dots{}).
+
+Interrupts are a signal coming from the peripherals to the CPU to
+notify it that a certain event occurred (a timer reached its target
+value, a button was pressed on the controller etc\dots{}). This way
+the CPU doesn't have to waste time
+\href{https://en.wikipedia.org/wiki/Polling_%28computer_science%29}{polling}
+  the status of the various peripherals, it can just wait for the
+  interrupt notification.
+
+Writing 0 to this register masks all interrupts so it seems that the
+BIOS wants to make sure it won't get interrupted before proceeding
+further.
+
+There's an other interrupt control register right before that one at
+\code{0x1f801070}. That one is called ``Interrupt Status'' and is used
+to query the status of the various interrupts (active or not).
+
+Since we don't have any peripheral yet it wouldn't make sense to
+implement interrupts at that point, we're going to ignore writes to
+these addresses for now\footnote{IRQ is a common abbreviation for
+  ``Interrupt Request''.}:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+        //...
+
+        if let Some(offset) = map::IRQ_CONTROL.contains(abs_addr) {
+            println!("IRQ control: {:x} <- {:08x}", offset, val);
+            return;
+        }
+
+        panic!("unhandled store32 into address {:08x}", addr);
+    }
+}
+
+/// Interrupt Control registers (status and mask)
+pub const IRQ_CONTROL: Range = Range(0x1f801070, 8);
+\end{lstlisting}
+
+\subsection{BGTZ instruction}
+
+The next unhandled instruction is \code{0x1ca00003} which is a
+``branch if greater than zero'' (BGTZ):
+
+\begin{lstlisting}[language=assembly]
+bgtz $5, +12
+\end{lstlisting}
+
+It's similar to the BEQ and BNE we've already encountered but
+instead of comparing two registers it compares a single general
+purpose register to 0.
+
+The comparison is done using signed integers. For unsigned integers
+the test would only ever be false if the register contained 0 and we
+can already test that with BNE:
+
+\begin{lstlisting}[language=assembly]
+bne $5, $zero, +12
+\end{lstlisting}
+
+So we have to be careful to cast to a signed integer before the
+comparison in our implementation:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Branch if Greater Than Zero
+    fn op_bgtz(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let s = instruction.s();
+
+        let v = self.reg(s) as i32;
+
+        if v > 0 {
+            self.branch(i);
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{BLEZ instruction}
+
+A few step later we encounter the complementary instruction
+\code{0x18a00005} which encodes ``branch if less than or equal to
+zero'' (BLEZ):
+
+\begin{lstlisting}[language=assembly]
+blez $5, +20
+\end{lstlisting}
+
+It's the same thing as BGTZ with the opposite predicate:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Branch if Less than or Equal to Zero
+    fn op_blez(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let s = instruction.s();
+
+        let v = self.reg(s) as i32;
+
+        if v <= 0 {
+            self.branch(i);
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{LBU instruction}
+
+After that we meet instruction \code{0x90ae0000} which is a ``load
+byte unsigned'' (LBU):
+
+\begin{lstlisting}[language=assembly]
+lbu $14, 0($5)
+\end{lstlisting}
+
+It's exactly like LB but without sign extension, the high 24 bits of
+the target register are set to 0:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Byte Unsigned
+    fn op_lbu(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        let v = self.load8(addr);
+
+        // Put the load in the delay slot
+        self.load = (t, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{JALR instruction}
+
+Then we encounter instruction \code{0x0100f809} which encodes a ``jump
+and link register'' (JALR):
+
+\begin{lstlisting}[language=assembly]
+jalr $31, $8
+\end{lstlisting}
+
+It's implemented like JR except that it also stores the return address
+in a general purpose register. Unlike JAL, JALR can store the return
+address in any general purpose register, not just \$ra:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Jump And Link Register
+    fn op_jalr(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+
+        let ra = self.pc;
+
+        // Store return address in `d`
+        self.set_reg(d, ra);
+
+        self.pc = self.reg(s);
+    }
+}
+\end{lstlisting}
+
+\subsection{BLTZ, BLTZAL, BGEZ and BGEZAL instructions}
+
+The next unhandled instruction, \code{0x04800003}, is a bit of a weird
+one: the six MSBs are \code{0b000001} which can encode four different
+instructions:
+
+\begin{itemize}
+\item ``branch if less than zero'' (BLTZ):
+
+  \begin{lstlisting}[language=assembly]
+bltz   $4, +12
+  \end{lstlisting}
+
+\item ``branch if less than zero and link'' (BLTZAL):
+
+  \begin{lstlisting}[language=assembly]
+bltzal $4, +12
+  \end{lstlisting}
+
+\item ``branch if greater than or equal to zero'' (BGEZ):
+  \begin{lstlisting}[language=assembly]
+bgez   $4, +12
+  \end{lstlisting}
+
+
+\item ``branch if greater than or equal to zero and link'' (BGEZAL):
+
+  \begin{lstlisting}[language=assembly]
+bgezal $4, +12
+  \end{lstlisting}
+
+\end{itemize}
+
+In order to figure out what to do exactly we need to look at bits 16
+and 20 in the instruction:
+
+\begin{itemize}
+\item If bit 16 is set then the instruction is BGEZ, otherwise it's
+  BLTZ.
+
+\item If bit 20 is set then the return address is linked in \$ra.
+\end{itemize}
+
+Here's how it can be implemented:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Various branch instructions: BGEZ, BLTZ, BGEZAL, BLTZAL.
+    /// Bits 16 and 20 are used to figure out which one to use.
+    fn op_bxx(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let s = instruction.s();
+
+        let instruction = instruction.0;
+
+        let is_bgez = (instruction >> 16) & 1;
+        let is_link = (instruction >> 20) & 1 != 0;
+
+        let v = self.reg(s) as i32;
+
+        // Test "less than zero"
+        let test = (v < 0) as u32;
+
+        // If the test is "greater than or equal to zero" we need
+        // to negate the comparison above since
+        // ("a >= 0" <=> "!(a < 0)"). The xor takes care of that.
+        let test = test ^ is_bgez;
+
+        if test != 0 {
+            if is_link {
+                let ra = self.pc;
+
+                // Store return address in R31
+                self.set_reg(RegisterIndex(31), ra);
+            }
+
+            self.branch(i);
+        }
+    }
+}
+\end{lstlisting}
+
+Instead of testing bit 16 directly I save a branch by xoring the value
+of \code{test} (which is a boolean 0 or 1) with it.
 
 \newpage
 
