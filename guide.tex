@@ -31,14 +31,15 @@
     morekeywords={nop,lui,move,%
                  j,jal,jr,jalr,%
                  add,addu,addiu,addi,subu,%
-                 sll,sra,srl,sltu,slti,%
+                 sll,sra,srl,slt,sltu,slti,sltiu,%
                  sw,sh,sb,or,ori,and,andi,%
                  mtc0,mtc1,mtc2,mtc3,%
                  mfc0,mfc1,mfc2,mfc3,%
                  li,lw,lh,lhu,lb,lbu,%
                  beq,bne,bgtz,blez,%
                  bltz, bltzal, bgez, bgezal,%
-                 div,divu,mul,
+                 div,divu,mul,mflo,mfhi,mtlo,mthi,%
+                 syscall,break,rfe,
                  },%
    sensitive,%
    moredelim=[s]{::}{::},%
@@ -3878,6 +3879,646 @@ impl Cpu {
             self.hi = (n % d) as u32;
             self.lo = (n / d) as u32;
         }
+    }
+}
+\end{lstlisting}
+
+\subsection{MFLO instruction}
+
+We've seen that divisions store their results in the HI and LO
+registers but we don't know how we access those yet. Unsurprisingly
+the next unhandled instruction does just that: \code{0x00001812} encodes
+``move from LO'' (MFLO):
+
+\begin{lstlisting}[language=assembly]
+mflo $3
+\end{lstlisting}
+
+This instruction simply moves the contents of LO in a general purpose
+register. This instruction would also stall if the division was not
+yet done but we'll implement that later:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Move From LO
+    fn op_mflo(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+
+        let lo = self.lo;
+
+        self.set_reg(d, lo);
+    }
+}
+\end{lstlisting}
+
+\subsection{SRL instruction}
+
+We've implemented SRA not long ago, now we encounter the sister
+instruction \code{0x00057082} which is a ``shift right logical''
+(SRL):
+
+\begin{lstlisting}[language=assembly]
+srl $14, $5, 2
+\end{lstlisting}
+
+It's very similiar to SRA except that the instruction treats the value
+as unsigned and fills the missing MSBs with 0 after the shift. In
+Rust, C and C++ we can achieve this behavior by shifting unsigned
+values:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Shift Right Logical
+    fn op_srl(&mut self, instruction: Instruction) {
+        let i = instruction.shift();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let v = self.reg(t) >> i;
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{SLTIU instruction}
+
+After that we meet \code{0x2c410045} which is ``set if
+less than immediate unsigned'' (SLTI):
+
+\begin{lstlisting}[language=assembly]
+sltiu $1, $2, 0x45
+\end{lstlisting}
+
+It's implemented like SLTI but using unsigned integers\footnote{Note
+  that the immediate is still sign extended even though it's then used
+  as an unsigned value.}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Set if Less Than Immediate Unsigned
+    fn op_sltiu(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = self.reg(s) < i;
+
+        self.set_reg(t, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{DIVU instruction}
+
+Now we encounter the other division instruction: \code{0x0064001b}
+which encodes ``divide unsigned'' (DIVU):
+
+\begin{lstlisting}[language=assembly]
+divu $3, $4
+\end{lstlisting}
+
+Since this version uses unsigned operands we only have one special
+case: the division by zero (the first line in
+table~\ref{tab:divspecial}). Thus the implementation is slightly
+shorter than DIV:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Divide Unsigned
+    fn op_divu(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let n = self.reg(s);
+        let d = self.reg(t);
+
+        if d == 0 {
+            // Division by zero, results are bogus
+            self.hi = n;
+            self.lo = 0xffffffff;
+        } else {
+            self.hi = n % d;
+            self.lo = n / d;
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{MFHI instruction}
+
+We already implemented MFLO, now we meet instruction \code{0x0000c810}
+which encodes ``move from HI'' (MFHI):
+
+\begin{lstlisting}[language=assembly]
+mfhi $25
+\end{lstlisting}
+
+Like MFLO it should be able to stall if the operation has not yet
+finished but we'll implement that later:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Move From HI
+    fn op_mflo(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+
+        let hi = self.hi;
+
+        self.set_reg(d, hi);
+    }
+}
+\end{lstlisting}
+
+\subsection{SLT instruction}
+
+The next unhandled instruction is \code{0x0338082a} which is ``set on
+less than'':
+
+\begin{lstlisting}[language=assembly]
+slt $1, $25, $24
+\end{lstlisting}
+
+It's like SLTU but with signed operands:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Set on Less Than (signed)
+    fn op_slt(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let s = self.reg(s) as i32;
+        let t = self.reg(t) as i32;
+
+        let v = s < t;
+
+        self.set_reg(d, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{Interrupt Control read}
+
+The BIOS then attempts to read from the Interrupt Mask
+register. Earlier we just ignored writes to this register (and the
+Interrupt Status register) so for now we'll return 0. We'll rewrite
+this code when we decide to implement interrupts:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 32bit word at `addr`
+    pub fn load32(&self, addr: u32) -> u32 {
+        //...
+
+        if let Some(offset) = map::IRQ_CONTROL.contains(abs_addr) {
+            println!("IRQ control read {:x}", offset);
+            return 0;
+        }
+
+	panic!("unhandled load32 at address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+\subsection{Timer registers}
+
+After that the BIOS wants to write 0 to \code{0x1f801104}. This
+address is one of the timer registers. Timers are basically just
+configurable counters that can generate interrupts at a predetermined
+rate. There are three independent timers on the Playstation.
+
+For now we won't have to actually implement them though because the
+BIOS just initializes them to a default disabled state by writing 0
+to all the configuration registers. We can just ignore those writes
+and move along:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 16bit halfword `val` into `addr`
+    pub fn store16(&mut self, addr: u32, _: u16) {
+        //...
+
+        if let Some(offset) = map::TIMERS.contains(abs_addr) {
+            println!("Unhandled write to timer register {:x}",
+                     offset);
+            return;
+        }
+
+        panic!("unhandled store16 into address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+\subsection{Exceptions}
+
+The next unhandled instruction is \code{0x0000000c} which encodes
+a ``system call'' (SYSCALL):
+
+\begin{lstlisting}[language=assembly]
+syscall 0
+\end{lstlisting}
+
+This instruction is used to explicitly trigger an
+exception. Exceptions occur when peripherals trigger an (unmasked)
+interrupt, when certain error occurs (unaligned memory access,
+checked overflow in certain instructions, etc\dots{}) or with commands
+which are meant to trigger an exception like SYSCALL or BREAK.
+
+When an exception occurs the following takes place in the CPU:
+
+\begin{itemize}
+  \item The current value of the PC is stored in \$cop0\_14, the EPC
+    (Exception PC) register\footnote{This is not entirely accurate
+    when the exception occurs in a branch delay slot. We'll review
+    that case in a minute},
+  \item Record the cause of the exception (syscall, overflow,
+    interrupt...) in \$cop0\_13, the CAUSE register,
+  \item Disable interrupts in \$cop0\_12 (SR),
+  \item Jump into the exception handler whose address is either
+    \code{0x80000080} or \code{0xbfc00180} depending on the value of
+    the BEV field (bit 22) in \$cop0\_12 (SR).
+\end{itemize}
+
+Unlike regular jumps and branches exceptions don't have a branch delay
+slot: the CPU jumps to the exception handler right after the current
+instruction.
+
+The problem is that with my current architecture we fetch an
+instruction ahead of time to emulate the branch delay slot. When an
+exception is triggered we'd have to replace that instruction by the
+first one in the exception handler. It's possible of course but it's a
+bit messy and I think it was a bad idea after all.
+
+Instead I'm going to use two variables for the PC: one will hold he
+current instruction and one will hold the ``next PC''. Normally
+\code{next\_pc} is always 4 bytes ahead but when a branch occurs we'll set
+the PC to the instruction in the delay slot and \code{next\_pc} to the
+branch target. In case of an exception however we'll set the PC to
+the exception handler address directly.
+
+Let's change our CPU state to reflect that change:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    /// The program counter register: points to the
+    /// next instruction
+    pc: u32,
+    /// Next value for the PC, used to simulate the
+    /// branch delay slot
+    next_pc: u32,
+    //...
+}
+
+impl Cpu {
+
+    pub fn new(inter: Interconnect) -> Cpu {
+        //...
+
+        // Reset value for the PC, beginning of BIOS memory
+        let pc = 0xbfc00000;
+
+        Cpu {
+            pc: pc,
+            next_pc: pc.wrapping_add(4),
+	    //...
+        }
+    }
+
+    //...
+}
+\end{lstlisting}
+
+We can then (once again) rework \code{run\_next\_instruction} to use
+our PC pair:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    pub fn run_next_instruction(&mut self) {
+        let pc = self.pc;
+
+        // Fetch instruction at PC
+        let instruction = Instruction(self.load32(pc));
+
+        // Increment next PC to point to the next instruction.
+        self.pc = self.next_pc;
+        self.next_pc = self.next_pc.wrapping_add(4);
+
+        // Execute the pending load (if any, otherwise it will load
+        // `R0` which is a NOP). `set_reg` works only on `out_regs`
+        // so this operation won't be visible by the next
+        // instruction.
+        let (reg, val) = self.load;
+        self.set_reg(reg, val);
+
+        // We reset the load to target register 0 for the next
+        // instruction
+        self.load = (RegisterIndex(0), 0);
+
+        self.decode_and_execute(instruction);
+
+        // Copy the output registers as input for the next instruction
+        self.regs = self.out_regs;
+    }
+}
+\end{lstlisting}
+
+Then we just need to modify our branch and jump functions to set
+\code{next\_pc} instead of \code{pc} to set the target address.
+
+After that we can implement our exception infrastructure. On top of
+\code{pc} and \code{next\_pc} we'll also need to store the address of
+the current instruction to store it in the EPC register
+(\$cop0\_14). We also need to add the CAUSE register to store the
+exception code:
+
+\begin{lstlisting}
+/// CPU state
+pub struct Cpu {
+    //...
+
+    /// Address of the instruction currently being executed. Used for
+    /// setting the EPC in exceptions.
+    current_pc: u32,
+    /// Cop0 register 13: Cause Register
+    cause: u32,
+    /// Cop0 register 14: EPC
+    epc: u32,
+}
+
+impl Cpu {
+    //...
+
+    pub fn run_next_instruction(&mut self) {
+        // Fetch instruction at PC
+        let instruction = Instruction(self.load32(self.pc));
+
+        // Save the address of the current instruction to save in
+        // `EPC` in case of an exception.
+        self.current_pc = self.pc;
+
+        //...
+    }
+}
+\end{lstlisting}
+
+
+Now that we've added the EPC and CAUSE registers for cop0 we can also
+add them to our implementation of MFC0:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Move From Coprocessor 0
+    fn op_mfc0(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = match cop_r {
+            12 => self.sr,
+            13 => self.cause,
+            14 => self.epc,
+            _  =>
+                panic!("Unhandled read from cop0r{}", cop_r),
+        };
+
+        self.load = (cpu_r, v)
+    }
+}
+\end{lstlisting}
+
+\subsection{SYSCALL instruction}
+
+Finally we can implement our exception infrastructure and our SYSCALL
+opcode. I'm going to use a \code{exception} method that will be used
+from various exception sources:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Trigger an exception
+    fn exception(&mut self, cause: Exception) {
+        // Exception handler address depends on the `BEV` bit:
+        let handler = match self.sr & (1 << 22) != 0 {
+            true  => 0xbfc00180,
+            false => 0x80000080,
+        };
+
+        // Shift bits [5:0] of `SR` two places to the left.
+        // Those bits are three pairs of Interrupt Enable/User
+        // Mode bits behaving like a stack 3 entries deep.
+        // Entering an exception pushes a pair of zeroes
+        // by left shifting the stack which disables
+        // interrupts and puts the CPU in kernel mode.
+        // The original third entry is discarded (it's up
+        // to the kernel to handle more than two recursive
+        // exception levels).
+        let mode = self.sr & 0x3f;
+        self.sr &= ~0x3f;
+        self.sr |= (mode << 2) & 0x3f;
+
+        // Update `CAUSE` register with the exception code (bits
+        // [6:2])
+        self.cause = (cause as u32) << 2;
+
+        // Save current instruction address in `EPC`
+        self.epc = self.current_pc;
+
+        // Exceptions don't have a branch delay, we jump directly
+        // into the handler
+        self.pc      = handler;
+        self.next_pc = self.pc.wrapping_add(4);
+    }
+
+    /// System Call
+    fn op_syscall(&mut self, _: Instruction) {
+        self.exception(Exception::SysCall);
+    }
+}
+
+/// Exception types (as stored in the `CAUSE` register)
+enum Exception {
+    /// System call (caused by the SYSCALL opcode)
+    SysCall = 0x8,
+}
+\end{lstlisting}
+
+Our \code{op\_syscall} method ends up being a one liner. All the logic
+is in the generic \code{exception} method.
+
+With this SYSCALL instruction the BIOS enters the exception
+handler. The NoCash specs tell us that we have to look at the contents
+of register \$4 to know what the BIOS is supposed to do. In this case
+\$4 contains 1 so it's supposed to run
+``\textit{EnterCriticalSection}''. This function is apparently
+supposed to disable all interrupts. Once this is done if everything
+works well the exception handler should return to the caller using an
+RFE instruction, let's continue and see if we find it as expected.
+
+\subsection{MTLO instruction}
+
+In the exception handler we stumble upon \code{0x00400013} which is
+``move to LO'' (MTLO):
+
+\begin{lstlisting}[language=assembly]
+mtlo $2
+\end{lstlisting}
+
+As its name implies it just moves the value from a general purpose
+register into the LO register. Be careful though because the
+instruction encoding is different from MFLO:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Move to LO
+    fn op_mtlo(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+
+        self.lo = self.reg(s);
+    }
+}
+\end{lstlisting}
+
+It might seem surprising to encounter this instruction: why would the
+BIOS want to move something \emph{into} the LO register? After all
+this register is for the \emph{result} of divisions and
+multiplications, you can't do anything with it besides reading it
+back.
+
+The answer is that exception handlers are not supposed to restore all
+register values before returning to the ``normal'' code flow. The
+reason is obvious: exceptions can be triggered by asynchronous
+interrupts so they can basically happen at any time. If the exception
+handler changes the value of any register before giving back the
+control to the interrupted code it could lead to bogus behaviour.
+
+For instance some game code could start a division and be interrupted
+before it reads the result in LO. Then the interrupt handler needs to
+compute an other division but does not restore the original value of
+the register before returning the control to the game. At that point
+the game reads LO expecting to get the result of its computation but
+instead it gets some garbage value left there by the
+handler. Obviously that would be problematic.
+
+To avoid this the prologue of the exception handler saves the value of
+the registers it might modify (including HI and LO) to the RAM and
+then loads them back in the epilogue.
+
+There are two exceptions though: registers \$26 and \$27` are reserved
+for the BIOS and are not preserved by the exception handler. In other
+words no code should use those registers when exceptions can occur
+because their content could change at any moment.
+
+\subsection{MTHI instruction}
+
+Unsurprisingly the MTLO is almost immediately followed by instruction
+\code{0x00400011} which is ``move to HI'' (MTHI):
+
+\begin{lstlisting}[language=assembly]
+mtlo $2
+\end{lstlisting}
+
+The implementation is almost identical to MTLO:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Move to HI
+    fn op_mthi(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+
+        self.hi = self.reg(s);
+    }
+}
+\end{lstlisting}
+
+\subsection{RFE intsruction}
+
+As expected once the exception handler is done it executes instruction
+\code{0x42000010} which is a coprocessor 0 opcode for ``return from
+exception'' (RFE):
+
+\begin{lstlisting}[language=assembly]
+rfe
+\end{lstlisting}
+
+All this instruction does is shift the Interrupt Enable/User Mode bits
+two places back to the right. This effectively undoes the opposite
+shift done when entering the handler and therefore puts the CPU back
+in the mode it was when the exception triggered (unless SR itself has
+been modified in the handler).
+
+It does not reset the PC however, it's up to the BIOS to fetch the
+address in EPC, increment it by 4 to point at the next instruction and
+jump to it. The RFE instruction is typically in the final jump delay
+slot (and that's exactly what the Playstation BIOS handler does in
+this case).
+
+The instruction encoding for RFE is a bit annoying: as usual we begin
+by checking bits [31:26] which are \code{0b010000} and introduce a
+coprocessor opcode. Then we check bits [25:21] to figure which one it
+is. For RFE it's \code{0b10000}.
+
+But it's not over! There can be multiple instructionts with this
+coprocessor encoding, although RFE is the only one implemented on the
+Playstation hardware (the others have to do with virtual memory). To
+make sure the requested instruction is the one we expect we must check
+bits [5:0] which must be equal to \code{0b010000}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Coprocessor 0 opcode
+    fn op_cop0(&mut self, instruction: Instruction) {
+        match instruction.cop_opcode() {
+            0b00000 => self.op_mfc0(instruction),
+            0b00100 => self.op_mtc0(instruction),
+            0b10000 => self.op_rfe(instruction),
+            _       => panic!("unhandled cop0 instruction {}", instruction)
+        }
+    }
+
+    /// Return From Exception
+    fn op_rfe(&mut self, instruction: Instruction) {
+        // There are other instructions with the same encoding but all
+        // are virtual memory related and the Playstation doesn't
+        // implement them. Still, let's make sure we're not running
+        // buggy code.
+        if instruction.0 & 0x3f != 0b010000 {
+            panic!("Invalid cop0 instruction: {}", instruction);
+        }
+
+        // Restore the pre-exception mode by shifting the Interrupt
+        // Enable/User Mode stack back to its original position.
+        let mode = self.sr & 0x3f;
+        self.sr &= !0x3f;
+        self.sr |= mode >> 2;
     }
 }
 \end{lstlisting}
