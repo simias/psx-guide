@@ -170,7 +170,7 @@ need to explain how a CPU works.
 
 A simple Von Neumann architecture looks like this: the CPU only sees a
 flat address space: an array of bytes. The PlayStation uses 32bit
-addresses so the CPU sees \code{1 << 32} addresses which means it
+addresses so the CPU sees \code{1 << 32} addresses. In other words it
 can address 4GB of memory. That's why the PlayStation is said to be a
 32bit console (that and the fact that it uses 32bit registers in the
 CPU as we'll see in a minute).
@@ -2808,7 +2808,7 @@ pub const RAM_SIZE: Range = Range(0x1f801060, 4);
 pub const CACHE_CONTROL: Range = Range(0xfffe0130, 4);
 \end{lstlisting}
 
-\subsection{LH instruction}
+\subsection{SH instruction}
 
 The next unhandled instruction is \code{0xa5200180} which encodes
 ``store halfword'' (SH). It's used to write 16bits (a halfword) to the
@@ -4522,6 +4522,306 @@ impl Cpu {
     }
 }
 \end{lstlisting}
+
+\subsection{Exceptions and branch delay slots}
+
+In our current implementation when an exception occurs we store the
+current instruction's address in `EPC`. That's correct in most cases
+but there's one exception in the MIPS archicture: when an exception
+occurs in a branch delay slot we must store the address of the
+\emph{branch} instruction in EPC\footnote{ This is only for
+  \emph{branch} delay slots, \emph{load} delay slots behave normally
+  exception-wise.}.
+
+Consider the following sequence where we have a `SYSCALL` instruction
+in a `JR` delay slot:
+
+\begin{lstlisting}[language=assembly]
+    jr $ra
+    syscall
+\end{lstlisting}
+
+In this case the CPU will put the address of the \code{jr \$ra}
+instruction in EPC before entering the exception handler. In order to
+signal this condition to the handler the CPU also sets bit 31 of the
+CAUSE register.
+
+In order to implement this behaviour we first need to keep track of
+whether or we're in a branch delay slot. It's tempting to just check
+whether or not the next instruction is 4 bytes ahead of the current
+one but it's technically possible to branch 4 bytes ahead, even though
+it wouldn't be very useful. Instead I'm going to play it safe and add
+new variables:
+
+\begin{lstlisting}
+pub struct Cpu {
+    //...
+
+    /// Set by the current instruction if a branch occured and the
+    /// next instruction will be in the delay slot.
+    branch: bool,
+    /// Set if the current instruction executes in the delay slot
+    delay_slot: bool,
+}
+
+impl Cpu {
+
+    pub fn new(inter: Interconnect) -> Cpu {
+        //...
+
+        Cpu {
+            //...
+            branch:     false,
+            delay_slot: false,
+        }
+    }
+
+    pub fn run_next_instruction(&mut self) {
+        //...
+        let instruction = Instruction(self.load32(self.pc));
+
+        // If the last instruction was a branch then we're in the
+        // delay slot
+        self.delay_slot = self.branch;
+        self.branch     = false;
+
+        self.decode_and_execute(instruction);
+
+        //...
+    }
+
+    //...
+}
+\end{lstlisting}
+
+Now we can simply modify (once again) all the branch and jump
+instructions to set \code{self.branch = true}. In the next cycle
+\code{run\_next\_instruction} will copy this variable to
+\code{self.delay\_slot}.
+
+Now that we keep track of delay slots we can modify our exception code
+to handle them accurately:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Trigger an exception
+    fn exception(&mut self, cause: Exception) {
+        //...
+
+        // Update `CAUSE` register with the exception code (bits
+        // [6:2])
+        self.cause = (cause as u32) << 2;
+
+        // Save current instruction address in `EPC`
+        self.epc = self.current_pc;
+
+        if self.delay_slot {
+            // When an exception occurs in a delay slot `EPC` points
+            // to the branch instruction and bit 31 of `CAUSE` is set.
+            self.epc = self.epc.wrapping_sub(4);
+            self.cause |= 1 << 31;
+        }
+
+        //...
+    }
+}
+\end{lstlisting}
+
+With our exception handling infrastructure in place we can take the
+opportunity to review some exception conditions we've ignored so far
+and implement them accurately.
+
+\subsection{ADD and ADDI overflows}
+
+The ADD and ADDI opcodes generate an exception on signed overflow but
+in our current implementation is incomplete. We can use our
+\code{exception} method to handle them in full:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Add and check for signed overflow
+    fn op_add(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let s = self.reg(s) as i32;
+        let t = self.reg(t) as i32;
+
+        match s.checked_add(t) {
+            Some(v) => self.set_reg(d, v as u32),
+            None    => self.exception(Exception::Overflow),
+        }
+    }
+
+    /// Add Immediate and check for signed overflow
+    fn op_addi(&mut self, instruction: Instruction) {
+        let i = instruction.imm_se() as i32;
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let s = self.reg(s) as i32;
+
+        match s.checked_add(i) {
+            Some(v) => self.set_reg(t, v as u32),
+            None    => self.exception(Exception::Overflow),
+        }
+    }
+}
+
+/// Exception types (as stored in the `CAUSE` register)
+enum Exception {
+    //...
+
+    /// Arithmetic overflow
+    Overflow = 0xc,
+}
+\end{lstlisting}
+
+\subsection{Store and load alignment exceptions}
+
+When a load or store instruction targets a misaligned address (i.e. a
+word access address is not a multiple of 4 or a halfword access
+address is not a multiple of 2) the CPU is supposed to generate an
+exception:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Word
+    fn op_lw(&mut self, instruction: Instruction) {
+        //...
+
+        // Address must be 32bit aligned
+        if addr % 4 == 0 {
+            let v = self.load32(addr);
+
+            // Put the load in the delay slot
+            self.load = (t, v);
+        } else {
+            self.exception(Exception::LoadAddressError);
+        }
+    }
+
+    /// Store Halfword
+    fn op_sh(&mut self, instruction: Instruction) {
+        //...
+
+        // Address must be 16bit aligned
+        if addr % 2 == 0 {
+            self.store16(addr, v as u16);
+        } else {
+            self.exception(Exception::StoreAddressError);
+        }
+    }
+
+    /// Store Word
+    fn op_sw(&mut self, instruction: Instruction) {
+        //...
+
+        // Address must be 32bit aligned
+        if addr % 4 == 0 {
+            self.store32(addr, v);
+        } else {
+            self.exception(Exception::StoreAddressError);
+        }
+    }
+}
+
+/// Exception types (as stored in the `CAUSE` register)
+enum Exception {
+    //...
+
+    /// Address error on load
+    LoadAddressError = 0x4,
+    /// Address error on store
+    StoreAddressError = 0x5,
+}
+\end{lstlisting}
+
+\subsection{PC alignment exception}
+
+We should also generate an exception if the PC address is not
+correctly aligned when we attempt to fetch an instruction. This can
+happen if a JR or JALR instruction jumped to an address that was not
+32bit aligned\footnote{It might be more efficient to add the test in
+  the branch and jump instructions capable of setting an invalid PC
+  but I don't really care about performance at that point and that
+  would make the code more complicated}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    pub fn run_next_instruction(&mut self) {
+        // Save the address of the current instruction to save in
+        // `EPC` in case of an exception.
+        self.current_pc = self.pc;
+
+        if self.current_pc % 4 != 0 {
+            // PC is not correctly aligned!
+            self.exception(Exception::LoadAddressError);
+            return;
+        }
+
+        // Fetch instruction at PC
+        let instruction = Instruction(self.load32(self.pc));
+
+        //...
+    }
+}
+\end{lstlisting}
+
+\subsection{RAM 16bit store}
+
+If the exceptions are implemented correctly our next unhandled
+condition should be a SH targeting address \code{0x800dee24}. This
+address is in the RAM so we just need to add 16bit store support for
+it:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 16bit halfword `val` into `addr`
+    pub fn store16(&mut self, addr: u32, val: u16) {
+
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::RAM.contains(abs_addr) {
+            return self.ram.store16(offset, val);
+        }
+
+        //...
+    }
+}
+\end{lstlisting}
+
+And then in our RAM implementation:
+
+\begin{lstlisting}
+impl Ram {
+    //...
+
+    /// Store the 16bit little endian halfword `val` into `offset`
+    pub fn store16(&mut self, offset: u32, val: u16) {
+        let offset = offset as usize;
+
+        let b0 = val as u8;
+        let b1 = (val >> 8) as u8;
+
+        self.data[offset + 0] = b0;
+        self.data[offset + 1] = b1;
+    }
+}
+\end{lstlisting}
+
+As always, make sure you get the endianess right.
 
 \newpage
 
