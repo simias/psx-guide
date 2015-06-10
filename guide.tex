@@ -32,13 +32,14 @@
                  j,jal,jr,jalr,%
                  add,addu,addiu,addi,subu,%
                  sll,sra,srl,slt,sltu,slti,sltiu,%
-                 sw,sh,sb,or,ori,and,andi,%
+                 sllv,srlv,srav,%
+                 sw,sh,sb,or,ori,and,andi,nor,%
                  mtc0,mtc1,mtc2,mtc3,%
                  mfc0,mfc1,mfc2,mfc3,%
                  li,lw,lh,lhu,lb,lbu,%
                  beq,bne,bgtz,blez,%
                  bltz, bltzal, bgez, bgezal,%
-                 div,divu,mul,mflo,mfhi,mtlo,mthi,%
+                 div,divu,mul,multu,mflo,mfhi,mtlo,mthi,%
                  syscall,break,rfe,
                  },%
    sensitive,%
@@ -475,7 +476,7 @@ guide it's probably better that we use the same file.
     Algorithm & Hash \\
     \hline
     MD5    & \code{924e392ed05558ffdb115408c263dccf} \\
-    SHA1   & \code{10155d8d6e6e832d6ea66db9bc098321fb5e8ebf} \\
+    SHA-1   & \code{10155d8d6e6e832d6ea66db9bc098321fb5e8ebf} \\
   \end{tabular}
 
   \caption{\code{SCPH1001.BIN} BIOS checksums}
@@ -483,7 +484,7 @@ guide it's probably better that we use the same file.
 \end{table}
 
 I've decided to go for the version named \code{SCPH1001.BIN}. The file
-should be *exactly* 512KB big. Check table~\ref{tab:checksums} to make
+should be \emph{exactly} 512KB big. Check table~\ref{tab:checksums} to make
 sure you got the right one.
 
 \subsection{Loading the BIOS}
@@ -4822,6 +4823,399 @@ impl Ram {
 \end{lstlisting}
 
 As always, make sure you get the endianess right.
+
+\subsection{DMA registers}
+
+We then stumble upon an unhandled load from address
+\code{0x1f8010f0}. Looking at the memory map this is the ``DMA control
+register''. DMA stands for
+\href{https://en.wikipedia.org/wiki/Direct_memory_access}{Direct
+  Memory Access}. This is a generic term which can mean different
+things on different architectures but the concept is always the same:
+it's used to move data between a peripheral and RAM without directly
+involving the CPU.
+
+For instance if a game wants to load a texture to the GPU memory it
+can set up the DMA to do the copy instead of doing it from the CPU
+with a series of LW/SW. This is generally faster since the DMA is
+usually more efficient for moving data around and while it's working
+the CPU can do more interesting things\footnote{Although on the
+  Playstation the CPU is seriously gimped while the DMA is running as
+  we'll see later}.
+
+Since we still have some work to do on the CPU let's see if we can
+ignore the DMA access for now:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 32bit word at `addr`
+    pub fn load32(&self, addr: u32) -> u32 {
+        //...
+
+        if let Some(_) = map::DMA.contains(abs_addr) {
+            println!("DMA read: {:08x}", abs_addr);
+            return 0;
+        }
+
+        panic!("unhandled load32 at address {:08x}", addr);
+    }
+}
+
+/// Direct Memory Access registers
+pub const DMA: Range = Range(0x1f801080, 0x80);
+\end{lstlisting}
+
+You'll notice that I ignore \emph{all} loads from \emph{any} DMA
+register, not just the control. Let's hope we'll be able to keep the
+smoke screen up for a little longer.
+
+Soon after that we encounter a SW targeting the DMA control register
+with the value \code{0x000b0000}. This value configures the DMA SPU
+channel priority and enables it. This probably means the BIOS is
+getting ready to play some sound. Since we don't care about the SPU or
+the DMA at that point let's ignore those writes as well:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+        //...
+
+        if let Some(_) = map::DMA.contains(abs_addr) {
+            println!("DMA write: {:08x} {:08x}", abs_addr, val);
+            return;
+        }
+
+        panic!("unhandled store32 into address {:08x}: {:08x}", addr, val);
+    }
+}
+\end{lstlisting}
+
+Hopefuly we should be able to ignore the DMA for a while and keep
+focusing on the CPU.
+
+\subsection{LHU instruction}
+
+The next unhandled instruction is \code{0x961901ae} which is ``load
+halfword unsigned'' (LHU):
+
+\begin{lstlisting}[language=assembly]
+lhu $25, 430($16)
+\end{lstlisting}
+
+It's the 16bit counterpart to LBU and it's our first 16bit load
+istruction:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load 16bit value from the memory
+    fn load16(&self, addr: u32) -> u16 {
+        self.inter.load16(addr)
+    }
+
+    /// Load Halfword Unsigned
+    fn op_lhu(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        // Address must be 16bit aligned
+        if addr % 2 == 0 {
+            let v = self.load16(addr);
+
+            // Put the load in the delay slot
+            self.load = (t, v as u32);
+        } else {
+            self.exception(Exception::LoadAddressError);
+        }
+    }
+}
+\end{lstlisting}
+
+We need to implement \code{load16} in the interconnect. The current
+instruction attempts to load from \code{0x1f801dae} which is the SPU
+status register. Let's lie once again and return 0 for SPU reads:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 16bit halfword at `addr`
+    pub fn load16(&self, addr: u32) -> u16 {
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(_) = map::SPU.contains(abs_addr) {
+            println!("Unhandled read from SPU register {:08x}",
+                     abs_addr);
+            return 0;
+        }
+
+        panic!("unhandled load16 at address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+If we continue the emulation we stumble on an other unhandled
+\code{load16}, this time at address \code{0x800dee24}. This one is
+easy, it's RAM:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 16bit halfword at `addr`
+    pub fn load16(&self, addr: u32) -> u16 {
+        //...
+
+        if let Some(offset) = map::RAM.contains(abs_addr) {
+            return self.ram.load16(offset);
+        }
+
+        panic!("unhandled load16 at address {:08x}", addr);
+    }
+
+}
+\end{lstlisting}
+
+And in our RAM implementation:
+
+\begin{lstlisting}
+impl Ram {
+    //...
+
+    /// Fetch the 16bit little endian halfword at `offset`
+    pub fn load16(&self, offset: u32) -> u16 {
+        let offset = offset as usize;
+
+        let b0 = self.data[offset + 0] as u16;
+        let b1 = self.data[offset + 1] as u16;
+
+        b0 | (b1 << 8)
+    }
+}
+\end{lstlisting}
+
+\subsection{SLLV instruction}
+
+After that we encounter \code{0x0078c804} which is ``shift left
+logical variable'' (SLLV):
+
+\begin{lstlisting}[language=assembly]
+sllv $25, $24, $3
+\end{lstlisting}
+
+It's like SLL except the shift amount is stored in a register instead
+of an immediate value.
+
+The implementation is quite simple but there's something to consider:
+so far the shift amount was always a 5bit immediate value but this
+time it's a 32bit register. What happens when the register value is
+greater than 31?
+
+It's also important to figure out because shifting out of range is
+undefined in Rust (and in C) so we have to be careful not to introduce
+weird undefined behavior in our emulator.
+
+Shifting by more than 31 places would mean shifting the 32bit value
+completely out of range. Intuitively you might say that it sets it to
+0 (all significant bits get shifted \emph{outside} the register) but
+it turns out it's not accurate.
+
+In reality on the R3000 CPU the shift amount is always implicitly
+masked with \texttt{0x1f} to only keep the low 5 bits. It means that
+a shift amount of 32 behaves like 0 (i.e. it's a NOP) while 130
+behaves like 2:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Shift Left Logical Variable
+    fn op_sllv(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        // Shift amount is truncated to 5 bits
+        let v = self.reg(t) << (self.reg(s) & 0x1f);
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{LH instruction}
+
+We implemented LHU not long ago and now we meet \code{0x87a30018}
+which is ``load halfword'' (LH):
+
+\begin{lstlisting}[language=assembly]
+lh $3, 24($29)
+\end{lstlisting}
+
+It's implemented like LHU but it sign-extends the 16bit value to fit
+the 32bit target register:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Halfword (signed)
+    fn op_lh(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        // Cast as i16 to force sign extension
+        let v = self.load16(addr) as i16;
+
+        // Put the load in the delay slot
+        self.load = (t, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{NOR instruction}
+
+After that we stumble upon \code{0x0040c827} which is ``bitwise not
+or'' (NOR):
+
+\begin{lstlisting}[language=assembly]
+nor $25, $2, $zero
+\end{lstlisting}
+
+It simply computes a bitwise OR between two registers and then
+complements the result before storing it in the destination
+register\footnote{Note that in this context \code{!} in rust does the
+  same thing as \code{\~{}} in C: it's the \emph{bitwise} NOT
+  operator.}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Bitwise Not Or
+    fn op_nor(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = !(self.reg(s) | self.reg(t));
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{SRAV instruction}
+
+The next unhandled instruction is \code{0x00e84007} which encodes
+``shift right arithmetic variable'' (SRAV):
+
+\begin{lstlisting}[language=assembly]
+srav $8, $8, $7
+\end{lstlisting}
+
+We've already implemented SRA and SLLV so this one shouldn't give us
+any trouble:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Shift Right Arithmetic Variable
+    fn op_srav(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        // Shift amount is truncated to 5 bits
+        let v = (self.reg(t) as i32) >> (self.reg(s) & 0x1f);
+
+        self.set_reg(d, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{SRLV instruction}
+
+We finally encounter the last shift instruction: \code{0x01a52806} is
+``shift right logical variable'' (SRLV):
+
+\begin{lstlisting}[language=assembly]
+srlv $5, $5, $13
+\end{lstlisting}
+
+It's implemented like SRAV without sign extension (or like SRL with a
+register holding the shift amount, if you prefer):
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Shift Right Logical Variable
+    fn op_srlv(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        // Shift amount is truncated to 5 bits
+        let v = self.reg(t) >> (self.reg(s) & 0x1f);
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{MULTU instruction}
+
+The next unhandled instruction is \code{0x01240019} which encodes
+``multiply unsigned'' (MULTU):
+
+\begin{lstlisting}[language=assembly]
+multu $9, $4
+\end{lstlisting}
+
+It's our first multiplication opcode. The CPU does the multiplication
+using 64bit arithmetics and store the result across the HI and LO
+registers:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Multiply Unsigned
+    fn op_multu(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let a = self.reg(s) as u64;
+        let b = self.reg(t) as u64;
+
+        let v = a * b;
+
+        self.hi = (v >> 32) as u32;
+        self.lo = v as u32;
+    }
+}
+\end{lstlisting}
+
+The timings of the multiplication instructions are similar to the
+divisions: they run in the background and only stall the CPU if it
+attempts to read the LO or HI registers before it's done. Since we
+don't implement accurate CPU timings I choose to ignore that for now.
 
 \newpage
 
