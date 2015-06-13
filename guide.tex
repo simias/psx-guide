@@ -143,7 +143,7 @@ Ready? Let's begin!
 That might seem like a silly question to some but I'm sure there are
 plenty of competent programmers out there who are used to program in
 high level managed environements haven't seen a register in their
-entire life. So let me make the introductions.
+entire life. Let me make the introductions.
 
 For our first version of the PlayStation CPU I'm going to make some
 simplifying assumptions. I'm going to ignore the caches for instance
@@ -222,7 +222,7 @@ As we've seen, the PlayStation uses 32bit addresses, so the PC
 register is 32bit wide (as are all other CPU registers for that
 matter).
 
-So a typical CPU execution cycle goes roughly like this:
+A typical CPU execution cycle goes roughly like this:
 
 \begin{enumerate}
   \item Fetch the instruction located at address PC,
@@ -991,7 +991,7 @@ the result of \$v0 + 0 but we avoid having to implement a dedicated
 \$ra (\$31) is the other general purpose register given a special
 meaning by the hardware since instructions like ``jump and link'' or
 ``branch and link'' put the return address in this register
-exclusively. So the following instruction jumps in function
+exclusively. Therefore the following instruction jumps in function
 \code{foo} and puts the return address in \$ra:
 
 \begin{lstlisting}[language=assembly]
@@ -5216,6 +5216,453 @@ The timings of the multiplication instructions are similar to the
 divisions: they run in the background and only stall the CPU if it
 attempts to read the LO or HI registers before it's done. Since we
 don't implement accurate CPU timings I choose to ignore that for now.
+
+\subsection{GPU registers}
+
+Our next stop will be an unhandled LW at address
+\code{0x1f801814}. This register is GPUSTAT when read and GP1 when
+written. In other words GPUSTAT is read only while GP1 is write only
+and they share the same address. Why not.
+
+GPUSTAT contains a whole bunch of information about the GPU
+status. Things like the display's resolution and color depth,
+interlacing, DMA channel status and more.
+
+It seems we're entering to the display initialization code, we might
+soon be pushing our first pixels to the screen! Boot logo, here we
+come.
+
+Well, let's not get ahead of ourselves, for now we have zero GPU
+emulation code so we're going to use the usual deception and have the
+BIOS read zeroes when it attempts to access the GPU register
+space. That's easy, there are only two registers in the GPU (well,
+four really: two read only and two write only sharing the same
+addresses):
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 32bit word at `addr`
+    pub fn load32(&self, addr: u32) -> u32 {
+        //...
+
+        if let Some(offset) = map::GPU.contains(abs_addr) {
+            println!("GPU read {}", offset);
+            return 0;
+        }
+
+        panic!("unhandled load32 at address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+\subsubsection{GP0 register}
+
+Very soon after that we get an unhandled \code{write32} at address
+\code{0x1f801810}. This is the other GPU register address. This one is
+GP0 for writing and it's used to queue commands.
+
+We'll study the GPU more closely soon but for now it suffices to say
+that it's programmed differently from the other peripherals we've seen
+so far: instead of having dedicated registers for the various
+function, the CPU (or DMA) queues commands in one of the two ports
+(GP0 and GP1) which behave like FIFOs. The GPU then executes the
+commands one after an other.
+
+Commands include drawing triangles, lines and sprites with various
+attributes but also things like interrupt management and display
+configuration.
+
+In order to interpret a GPU command we must first see to which port it
+was posted (GP0 in this case). Then we must look at the value:
+\code{0xe1001000} here. The high byte (0xe1) is the ``opcode'', the
+remaining 24bits are parameters whose meaning depends on the command.
+
+This particular opcode is ``Draw Mode Setting''. It mostly sets a
+bunch of texture-related parameters. In this particular instance only
+bit 12 is set which activates ``Textured Rectangle X-Flip''. Not
+exactly obvious why the BIOS is doing this right now but I guess we'll
+figure out that soon.
+
+For now we're still working on our CPU, so let's just ignore writes to
+the GPU ports and hope we can get away with it:
+
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+        //...
+
+        if let Some(offset) = map::GPU.contains(abs_addr) {
+            println!("GPU write {}: {:08x}", offset, val);
+            return;
+        }
+
+        panic!("unhandled store32 into address {:08x}: {:08x}", addr, val);
+    }
+}
+\end{lstlisting}
+
+\subsection{Interrupt Control 16bit access}
+
+Unfortunately we don't go very far, the BIOS then wants to make a
+16bit read at the Interrupt Mask address. So far we've only
+implemented 32bit access so let's add halfword support:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 16bit halfword at `addr`
+    pub fn load16(&self, addr: u32) -> u16 {
+        //...
+
+        if let Some(offset) = map::IRQ_CONTROL.contains(abs_addr) {
+            println!("IRQ control read {:x}", offset);
+            return 0;
+        }
+    }
+}
+\end{lstlisting}
+
+Unsurprisingly it's followed by a 16 bit write to the same address
+with the value 1. This means that the BIOS wants to use the first
+interrupt which is the vertical blanking interrupt generated by the
+GPU's video output. As usual let's ignore that:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 16bit halfword `val` into `addr`
+    pub fn store16(&mut self, addr: u32, val: u16) {
+        //...
+
+        if let Some(offset) = map::IRQ_CONTROL.contains(abs_addr) {
+            println!("IRQ control write {:x}, {:04x}", offset, val);
+            return;
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{Timer registers 32bit access}
+
+After that we get an unhandled 32bit access to the timers range.
+
+This time the BIOS wants to store \code{0xffffffff} at
+\code{0x1f801118} which is the counter target value for timer 1. When
+the counter reaches that value it goes back to 0 and optionally
+generates an interrupt. The counter is only 16bit wide though so this
+write would actually set the target value to \code{0xffff} and the
+upper 16bits are ignored.
+
+Let's add our usual placeholder code:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+        //...
+
+        if let Some(offset) = map::TIMERS.contains(abs_addr) {
+            println!("Unhandled write to timer register {:x}: {:08x}",
+                     offset, val);
+            return;
+        }
+    }
+}
+\end{lstlisting}
+
+After that the BIOS writes \code{0x148} to \code{0x1f801114} which
+sets the timer 1 mode. Bit \code{0x8} clears the counter (resets it to
+0), bit \code{0x40} sets the timer interrupt to repeat mode which
+means that it will fire periodically when the counter reaches the
+target. Finally bit \code{0x100} sets the clock source as ``horizontal
+blanking''. It means that the timer increments when the display
+reaches the horizontal blanking period.
+
+This doesn't set bit \code{0x10} however which would actually enable
+the interrupt. And it hasn't attempted to unmask the interrupt in the
+Interrupt Mask register either anyway. Not sure where the BIOS is
+going with this.
+
+After that the BIOS tries to change the value of the Interrupt Mask
+and enables interrupt \code{0x8} which is the DMA's.
+
+\subsection{GPUSTAT ``DMA ready'' field}
+
+At this point the BIOS enters an infinite loop: it reads the GPUSTAT
+register again and again. Obviously it's waiting for something to
+happen but since we only ever return 0 it deadlocks.
+
+If we disassemble that loop the code looks like this (it's in the BIOS
+at address \code{0xbfc04190}):
+
+\begin{lstlisting}[language=assembly]
+lw $8, 0($6)     /* Here $6 is equal to 0x1f801814 (GPUSTAT) */
+nop              /* load delay slot */
+and $9, $8, $4   /* Here $4 contains 0x10000000 */
+beq $9, $0, -44  /* Loop back if $9 is zero */
+\end{lstlisting}
+
+There are more things in the loop but that's the important part. We
+can see that the BIOS loads GPUSTAT, masks bit 28 and loops if it's 0.
+
+If we look at the specs we can see that bit 28 of GPUSTAT tells if the
+GPU is ready to receive a DMA block. So it seems that the BIOS is
+polling this bit in GPUSTAT because it's about to initiate a DMA
+transfer between the RAM and the GPU.
+
+Let's modify our GPUSTAT handling code to return \code{0x10000000}
+when read:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 32bit word at `addr`
+    pub fn load32(&self, addr: u32) -> u32 {
+        //...
+
+        if let Some(offset) = map::GPU.contains(abs_addr) {
+	    println!("GPU read {}", offset);
+            return match offset {
+                // GPUSTAT: set bit 28 to signal that the GPU is ready
+                // to receive DMA blocks
+                4 => 0x10000000,
+                _ => 0,
+            }
+        }
+
+        //...
+    }
+}
+\end{lstlisting}
+
+This lets the BIOS continue the execution a little further.
+
+\subsection{XOR instruction}
+
+We then encounter an unhandled instruction: \code{0x0303c826} which
+encodes an ``exclusive or'' (XOR):
+
+\begin{lstlisting}[language=assembly]
+xor $25, $24, $3
+\end{lstlisting}
+
+We can implement it by copying the OR method and replacing the
+\code{|} operator with \code{\^{}}:
+
+\begin{lstlisting}
+mod Cpu {
+    //...
+
+    /// Bitwise Exclusive Or
+    fn op_xor(&mut self, instruction: Instruction) {
+        let d = instruction.d();
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let v = self.reg(s) ^ self.reg(t);
+
+        self.set_reg(d, v);
+    }
+}
+\end{lstlisting}
+
+With this instruction implemented the BIOS then goes on to write a
+bunch of DMA registers and then gets stuck in an other infinite loop,
+polling GPUSTAT once again.
+
+We could look at what the BIOS is doing once again to try and figure
+out the right value to return to let it continue but that would be a
+bit pointless at that point. We've almost implemented all the CPU
+instructions anyway and we've reach the part of the BIOS where the
+bootup logo is drawn. We need to implement the DMA to send the
+commands to the GPU and then emulate the GPU itself to accept those
+commands and draw on the screen.
+
+Before we move on though let's implement the handful of CPU opcodes we
+haven't yet encountered. At this point we've implemented 48 opcodes
+and 19 are remaining.  Fortunately most of those are variations of
+instructions we've already implemented so let's get this over with.
+
+\subsection{BREAK instructions}
+
+BREAK triggers an exception like SYSCALL but it sets code 9 in the
+CAUSE register. This instruction is generally meant to create software
+breakpoints in code for debugging purposes but I imagine some games
+might abuse it for other purposes.
+
+This instruction is encoded by setting bits [31:26] of the
+instruction to zero and bits [5:0] to \code{0xd}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Break
+    fn op_break(&mut self, _: Instruction) {
+        self.exception(Exception::Break);
+    }
+}
+
+/// Exception types (as stored in the `CAUSE` register)
+enum Exception {
+    //...
+
+    /// Breakpoint (caused by the BREAK opcode)
+    Break = 0x9,
+}
+\end{lstlisting}
+
+\subsection{MULT instruction}
+
+``Multiply'' (MULT) is simply the signed counterpart to MULTU. It
+multiplies its operands using 64bit signed arithmetics and stores
+stores the result in HI and LO.
+
+This instruction is encoded by setting bits [31:26] of the
+instruction to zero and bits [5:0] to \code{0x18}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Multiply (signed)
+    fn op_mult(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+
+        let a = (self.reg(s) as i32) as i64;
+        let b = (self.reg(t) as i32) as i64;
+
+        let v = (a * b) as u64;
+
+        self.hi = (v >> 32) as u32;
+        self.lo = v as u32;
+    }
+}
+\end{lstlisting}
+
+All those casts are a bit ugly but they're necessary to get the proper
+sign extension.
+
+\subsection{SUB instruction}
+
+``Substract'' (SUB) is like SUBU but with signed arithmetics
+\emph{and} it triggers an exception on signed overflow.
+
+This instruction is encoded by setting bits [31:26] of the
+instruction to zero and bits [5:0] to \code{0x22}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Substract and check for signed overflow
+    fn op_sub(&mut self, instruction: Instruction) {
+        let s = instruction.s();
+        let t = instruction.t();
+        let d = instruction.d();
+
+        let s = self.reg(s) as i32;
+        let t = self.reg(t) as i32;
+
+        match s.checked_sub(t) {
+            Some(v) => self.set_reg(d, v as u32),
+            None    => self.exception(Exception::Overflow),
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{XORI instruction}
+
+``Exclusive or immediate'' (XORI) is the version of the XOR
+instruction taking an immediate operand. We can implement it by taking
+the code for ORI and changing the operator.
+
+This instruction is encoded by setting bits [31:26] of the
+instruction to \code{0xe}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Bitwise eXclusive Or Immediate
+    fn op_xori(&mut self, instruction: Instruction) {
+        let i = instruction.imm();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let v = self.reg(s) ^ i;
+
+        self.set_reg(t, v);
+    }
+}
+\end{lstlisting}
+
+\subsection{Cop1, cop2 and cop3 opcodes}
+
+We've implemented cop0 instructions (MTC0, RFE etc\dots{}). The three
+other coprocessors can also have dedicated opcodes. On the Playstation
+however cop1 and cop3 are not used so any instruction targeting them
+will trigger an exception with code \code{0xb} to signal a coprocessor
+error..
+
+Cop1 and cop3 opcodes are encoded by setting bits [31:26] of the
+instruction to \code{0x11} and \code{0x13} respectively.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Coprocessor 1 opcode (does not exist on the Playstation)
+    fn op_cop1(&mut self, _: Instruction) {
+        self.exception(Exception::CoprocessorError);
+    }
+
+    /// Coprocessor 3 opcode (does not exist on the Playstation)
+    fn op_cop3(&mut self, _: Instruction) {
+        self.exception(Exception::CoprocessorError);
+    }
+}
+
+/// Exception types (as stored in the `CAUSE` register)
+enum Exception {
+    //...
+
+    /// Unsupported coprocessor operation
+    CoprocessorError = 0xb,
+}
+\end{lstlisting}
+
+Cop2 however is implemented on the Playstation: it's the Geometry
+Transform Engine (GTE). We don't need to implement the GTE for now so
+let's just add a dummy implementation that will crash the emulator if
+a GTE instruction is encountered.
+
+Cop opcodes are encoded by setting bits [31:26] of the
+instruction to \code{0x12}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Coprocessor 2 opcode (GTE)
+    fn op_cop2(&mut self, instruction: Instruction) {
+        panic!("unhandled GTE instruction: {}", instruction);
+    }
+}
+\end{lstlisting}
 
 \newpage
 
