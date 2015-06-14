@@ -36,7 +36,7 @@
                  sw,sh,sb,or,ori,and,andi,nor,%
                  mtc0,mtc1,mtc2,mtc3,%
                  mfc0,mfc1,mfc2,mfc3,%
-                 li,lw,lh,lhu,lb,lbu,%
+                 li,lw,lh,lhu,lb,lbu,lwl,lwr,%
                  beq,bne,bgtz,blez,%
                  bltz, bltzal, bgez, bgezal,%
                  div,divu,mul,multu,mflo,mfhi,mtlo,mthi,%
@@ -5663,6 +5663,524 @@ impl Cpu {
     }
 }
 \end{lstlisting}
+
+\subsection{Non-aligned reads}
+
+So far we've seen that all CPU memory transactions had to be properly
+aligned or they would trigger an exception. The MIPS instruction set
+does however have limited support for unaligned access. For unaligned
+reads it provides ``load word left'' (LWL) and ``load word right''
+(LWR).
+
+Both those instruction work by fetching the \emph{aligned} word
+containing the addressed byte and then shifting the value to only
+update the correct portion of the target register.
+
+Therefore in order to load a single unaligned word you need to run a
+both a LWL and a LWR in sequence (the order doesn't matter) to fetch
+the 32bits.
+
+The behaviour of both these instructions changes depending on whether
+the CPU is running in big or little-endian mode. Since the PSX runs
+exclusively in little endian we can ignore the other case.
+
+For a little endian architecture and assuming \$2 contains the
+potentially unaligned load address the sequence would look like this:
+
+\begin{lstlisting}[language=assembly]
+/* Load right part of potentially unaligned word at $2 */
+lwr $1, 0($2)
+/* Load left part of potentially unaligned word at $2 */
+lwl $1, 3($2)
+\end{lstlisting}
+
+After this sequence \$1 contains the 4byte little endian value at the
+address stored in \$2 regardless of its alignment.
+
+You can see that the LWL instruction is given an offset of 3. If the
+address was correctly aligned we remain within the same \emph{aligned}
+32bit word, otherwise we've moved to the next one.
+
+Okay, that might sound a bit complicated, hopefully everything will be
+clearer when we see the code of the implementation.
+
+Before that however it's important to note a specificity of these
+unaligned word instructions: you'll notice that in my asm snippet
+above I run the two instructions back-to-back without delay. That's
+because those instructions can merge their data with that of a pending
+load without having to wait for the load to finish.
+
+For other load instructions it wouldn't make a lot of sense (why would
+you want to load twice to the same target register without doing
+anything with the first value?) but since LWL and LWR are meant to be
+used together to load a single value it makes sense to spare a cycle
+there\footnote{Interesting bit of trivia: apparently the LWL and LWR
+  instructions were
+  \href{https://encrypted.google.com/patents/US4814976}{patented}. The
+  patent expired in 2006 and
+  \href{https://www.linux-mips.org/archives/linux-mips/2003-05/msg00189.html}{some
+    people} claimed that it might also have covered software
+  implementations. If that's true it means one could not have
+  distributed our emulator without a license from MIPS Computer
+  Systems.}.
+
+\subsubsection{LWL instruction}
+
+The ``load word left'' (LWL) opcode is encoded by setting bits [31:26]
+of the instruction to \code{0x22}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Word Left (little-endian only implementation)
+    fn op_lwl(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        // This instruction bypasses the load delay restriction: this
+        // instruction will merge the new contents with the value
+        // currently being loaded if need be.
+        let cur_v = self.out_regs[t.0 as usize];
+
+        // Next we load the *aligned* word containing the first
+        // addressed byte
+        let aligned_addr = addr & !3;
+        let aligned_word = self.load32(aligned_addr);
+
+        // Depending on the address alignment we fetch the 1, 2, 3 or
+        // 4 *most* significant bytes and put them in the target
+        // register.
+        let v = match addr & 3 {
+            0 => (cur_v & 0x00ffffff) | (aligned_word << 24),
+            1 => (cur_v & 0x0000ffff) | (aligned_word << 16),
+            2 => (cur_v & 0x000000ff) | (aligned_word << 8),
+            3 => (cur_v & 0x00000000) | (aligned_word << 0),
+            _ => unreachable!(),
+        };
+
+        // Put the load in the delay slot
+        self.load = (t, v);
+    }
+}
+\end{lstlisting}
+
+Hopefully the comments are clear enough to follow what the code is
+doing. You can see that LWL updates one, two, three or all four bytes
+in the target register depending on the address alignment.
+
+Note the direct reference to \code{self.out\_regs} instead of our usual
+helper to make sure we ignore the load delay when the two instructions
+are used in sequence.
+
+\subsubsection{LWR instruction}
+
+The ``load word right'' (LWR) opcode is encoded by setting bits
+[31:26] of the instruction to \code{0x26}. The implementation is very
+similar to LWL with a few key changes:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Word Right (little-endian only implementation)
+    fn op_lwr(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        // This instruction bypasses the load delay restriction: this
+        // instruction will merge the new contents with the value
+        // currently being loaded if need be.
+        let cur_v = self.out_regs[t.0 as usize];
+
+        // Next we load the *aligned* word containing the first
+        // addressed byte
+        let aligned_addr = addr & !3;
+        let aligned_word = self.load32(aligned_addr);
+
+        // Depending on the address alignment we fetch the 1, 2, 3 or
+        // 4 *least* significant bytes and put them in the target
+        // register.
+        let v = match addr & 3 {
+            0 => (cur_v & 0x00000000) | (aligned_word >> 0),
+            1 => (cur_v & 0xff000000) | (aligned_word >> 8),
+            2 => (cur_v & 0xffff0000) | (aligned_word >> 16),
+            3 => (cur_v & 0xffffff00) | (aligned_word >> 24),
+            _ => unreachable!(),
+        };
+
+        // Put the load in the delay slot
+        self.load = (t, v);
+    }
+}
+\end{lstlisting}
+
+You can see that like LWL we update from one to four bytes depending
+on the alignment, however this time it's the least significant bytes.
+
+\subsection{Non-aligned writes}
+
+Naturally the MIPS instruction set doesn't only support loading
+non-aligned words, it can also store them using ``store word left''
+(SWL) and ``store word right'' (SWR).
+
+The concept is the same: to store a 32bit integer at an unaligned
+access one would call SWR and SWL in sequence to update the entire
+word.
+
+\subsubsection{SWL instruction}
+
+The ``store word left'' (SWL) opcode is encoded by setting bits
+[31:26] of the instruction to \code{0x2a}. Since we only update part
+of the \emph{aligned} target word we have to fetch its value before we
+can modify it and store it back again:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Store Word Left (little-endian only implementation)
+    fn op_swl(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+        let v    = self.reg(t);
+
+        let aligned_addr = addr & !3;
+        // Load the current value for the aligned word at the target
+        // address
+        let cur_mem = self.load32(aligned_addr);
+
+        let mem = match addr & 3 {
+            0 => (cur_mem & 0xffffff00) | (v >> 24),
+            1 => (cur_mem & 0xffff0000) | (v >> 16),
+            2 => (cur_mem & 0xff000000) | (v >> 8),
+            3 => (cur_mem & 0x00000000) | (v >> 0),
+            _ => unreachable!(),
+        };
+
+        self.store32(addr, mem);
+    }
+}
+\end{lstlisting}
+
+\subsubsection{SWR instruction}
+
+The ``store word right'' (SWR) opcode is encoded by setting bits
+[31:26] of the instruction to \code{0x2e}. It's very similar to SWL
+except for a a few key differences:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Store Word Right (little-endian only implementation)
+    fn op_swr(&mut self, instruction: Instruction) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+        let v    = self.reg(t);
+
+        let aligned_addr = addr & !3;
+        // Load the current value for the aligned word at the target
+        // address
+        let cur_mem = self.load32(aligned_addr);
+
+        let mem = match addr & 3 {
+            0 => (cur_mem & 0x00000000) | (v << 0),
+            1 => (cur_mem & 0x000000ff) | (v << 8),
+            2 => (cur_mem & 0x0000ffff) | (v << 16),
+            3 => (cur_mem & 0x00ffffff) | (v << 24),
+            _ => unreachable!(),
+        };
+
+        self.store32(addr, mem);
+    }
+}
+\end{lstlisting}
+
+\subsection{Coprocessor loads and stores}
+
+We've seen that MTC0 and MFC0 can be used to move data between the
+general purpose registers and the coprocessor 0. That means that if
+you want to load or store a cop0 register value from or to the memory
+we have to pass through the CPU general purpose registers.
+
+The coprocessor 2 (the GTE) supports an additional, more optimized way
+to do this: ``load word to coprocessor 2'' (LWC2) and ``store word
+from coprocessor 2''(SWC2). Those instructions respectively load and
+store a cop2 register directly from and to memory.
+
+Since the other coprocessors don't support these opcodes they generate
+a ``coprocessor error'' exception when they're encountered.
+
+\subsubsection{LWCn instructions}
+
+``Load word coprocessor \emph{n}'' (LWC\emph{n}) opcodes are encoded
+by setting bits [31:26] of the instruction \code{0x30}~+~\emph{n}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Load Word in Coprocessor 0
+    fn op_lwc0(&mut self, _: Instruction) {
+        // Not supported by this coprocessor
+        self.exception(Exception::CoprocessorError);
+    }
+
+    /// Load Word in Coprocessor 1
+    fn op_lwc1(&mut self, _: Instruction) {
+        // Not supported by this coprocessor
+        self.exception(Exception::CoprocessorError);
+    }
+
+    /// Load Word in Coprocessor 2
+    fn op_lwc2(&mut self, instruction: Instruction) {
+        panic!("unhandled GTE LWC: {}", instruction);
+    }
+
+    /// Load Word in Coprocessor 3
+    fn op_lwc3(&mut self, _: Instruction) {
+        // Not supported by this coprocessor
+        self.exception(Exception::CoprocessorError);
+    }
+}
+\end{lstlisting}
+
+\subsubsection{SWCn instructions}
+
+``Store word coprocessor \emph{n}'' (SWC\emph{n}) opcodes are encoded
+by setting bits [31:26] of the instruction \code{0x38}~+~\emph{n}.
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Store Word in Coprocessor 0
+    fn op_swc0(&mut self, _: Instruction) {
+        // Not supported by this coprocessor
+        self.exception(Exception::CoprocessorError);
+    }
+
+    /// Store Word in Coprocessor 1
+    fn op_swc1(&mut self, _: Instruction) {
+        // Not supported by this coprocessor
+        self.exception(Exception::CoprocessorError);
+    }
+
+    /// Store Word in Coprocessor 2
+    fn op_swc2(&mut self, instruction: Instruction) {
+        panic!("unhandled GTE SWC: {}", instruction);
+    }
+
+    /// Store Word in Coprocessor 3
+    fn op_swc3(&mut self, _: Instruction) {
+        // Not supported by this coprocessor
+        self.exception(Exception::CoprocessorError);
+    }
+}
+\end{lstlisting}
+
+\subsection{Illegal instructions}
+
+We now have implemented (at least partially) all the CPU instructions!
+That doesn't mean that our CPU is complete: we still have to implement
+the GTE coprocessor and the cache for instance but that will wait for
+later.
+
+We can also take this opportunity to implement illegal
+instructions. For instance instruction \code{0x50000000} doesn't
+encode any valid instruction on the Playstation CPU and is therefore
+illegal.
+
+Illegal instructions simply trigger an exception on the CPU with the
+code \code{0xa} in the CAUSE register.
+
+Knowing that we can complete our \code{decode\_and\_execute} function,
+here's what it should look like with all instructions implemented:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Decode `instruction`'s opcode and run the function
+    fn decode_and_execute(&mut self, instruction: Instruction) {
+        match instruction.function() {
+            0b000000 => match instruction.subfunction() {
+                0b000000 => self.op_sll(instruction),
+                0b000010 => self.op_srl(instruction),
+                0b000011 => self.op_sra(instruction),
+                0b000100 => self.op_sllv(instruction),
+                0b000110 => self.op_srlv(instruction),
+                0b000111 => self.op_srav(instruction),
+                0b001000 => self.op_jr(instruction),
+                0b001001 => self.op_jalr(instruction),
+                0b001100 => self.op_syscall(instruction),
+                0b001101 => self.op_break(instruction),
+                0b010000 => self.op_mfhi(instruction),
+                0b010001 => self.op_mthi(instruction),
+                0b010010 => self.op_mflo(instruction),
+                0b010011 => self.op_mtlo(instruction),
+                0b011000 => self.op_mult(instruction),
+                0b011001 => self.op_multu(instruction),
+                0b011010 => self.op_div(instruction),
+                0b011011 => self.op_divu(instruction),
+                0b100000 => self.op_add(instruction),
+                0b100001 => self.op_addu(instruction),
+                0b100010 => self.op_sub(instruction),
+                0b100011 => self.op_subu(instruction),
+                0b100100 => self.op_and(instruction),
+                0b100101 => self.op_or(instruction),
+                0b100110 => self.op_xor(instruction),
+                0b100111 => self.op_nor(instruction),
+                0b101010 => self.op_slt(instruction),
+                0b101011 => self.op_sltu(instruction),
+                _        => self.op_illegal(instruction),
+            },
+            0b000001 => self.op_bxx(instruction),
+            0b000010 => self.op_j(instruction),
+            0b000011 => self.op_jal(instruction),
+            0b000100 => self.op_beq(instruction),
+            0b000101 => self.op_bne(instruction),
+            0b000110 => self.op_blez(instruction),
+            0b000111 => self.op_bgtz(instruction),
+            0b001000 => self.op_addi(instruction),
+            0b001001 => self.op_addiu(instruction),
+            0b001010 => self.op_slti(instruction),
+            0b001011 => self.op_sltiu(instruction),
+            0b001100 => self.op_andi(instruction),
+            0b001101 => self.op_ori(instruction),
+            0b001110 => self.op_xori(instruction),
+            0b001111 => self.op_lui(instruction),
+            0b010000 => self.op_cop0(instruction),
+            0b010001 => self.op_cop1(instruction),
+            0b010010 => self.op_cop2(instruction),
+            0b010011 => self.op_cop3(instruction),
+            0b100000 => self.op_lb(instruction),
+            0b100001 => self.op_lh(instruction),
+            0b100010 => self.op_lwl(instruction),
+            0b100011 => self.op_lw(instruction),
+            0b100100 => self.op_lbu(instruction),
+            0b100101 => self.op_lhu(instruction),
+            0b100110 => self.op_lwr(instruction),
+            0b101000 => self.op_sb(instruction),
+            0b101001 => self.op_sh(instruction),
+            0b101010 => self.op_swl(instruction),
+            0b101011 => self.op_sw(instruction),
+            0b101110 => self.op_swr(instruction),
+            0b110000 => self.op_lwc0(instruction),
+            0b110001 => self.op_lwc1(instruction),
+            0b110010 => self.op_lwc2(instruction),
+            0b110011 => self.op_lwc3(instruction),
+            0b111000 => self.op_swc0(instruction),
+            0b111001 => self.op_swc1(instruction),
+            0b111010 => self.op_swc2(instruction),
+            0b111011 => self.op_swc3(instruction),
+            _        => self.op_illegal(instruction),
+        }
+    }
+
+    /// Illegal instruction
+    fn op_illegal(&mut self, instruction: Instruction) {
+        println!("Illegal instruction {}!", instruction);
+        self.exception(Exception::IllegalInstruction);
+    }
+}
+
+/// Exception types (as stored in the `CAUSE` register)
+enum Exception {
+    //...
+
+   /// CPU encountered an unknown instruction
+    IllegalInstruction = 0xa,
+}
+\end{lstlisting}
+
+That's quite a milestone but it's only the beginning. While
+implementing all those instructions and stepping through the BIOS
+we've seen that it tries to use many peripherals: the SPU, the timers,
+the DMA and the GPU in particular.
+
+At this point my first objective is to display an image to the screen
+so I want to start implementing the GPU as soon as possible. But we
+won't be able to do anything useful with the GPU without the DMA, so
+let's start with that.
+
+\section{The DMA: Ordering tables and the GPU}
+
+The \href{https://en.wikipedia.org/wiki/Direct_memory_access}{DMA} is
+used to move data back and forth between the RAM and a peripheral
+(GPU, CDROM, SPU, etc\dots{}). The CPU could achieve the same results
+by a series of loads/stores but the DMA is generally much faster.
+
+The Playstation DMA controller lives alongside the CPU and shares the
+memory BUS with it. It means that while the DMA is busy transferring
+data the CPU is stopped: only one device can access the BUS at a given
+time. The DMA can only copy data between the RAM and a device, not
+directly between two devices.  For instance you can't copy a texture
+from the CDROM directly into the GPU with the DMA, you first have to
+make a transfer from the CDROM into the main RAM and then a 2nd one
+between the RAM and the GPU.
+
+There are 7 DMA channels on the Playstation:
+
+\begin{itemize}
+\item Channel 0 is connected to the Media Decoder input
+\item Channel 1 is connected to the Media Decoder output
+\item Channel 2 is connected to the GPU
+\item Channel 3 is connected to the CDROM drive
+\item Channel 4 is connected to the SPU
+\item Channel 5 is connected to the extension port
+\item Channel 6 is only connected to the RAM and is used to clear an
+  ``ordering table''
+\end{itemize}
+
+
+Implementing complete and accurate DMA support can be quite
+tricky. The main problem is that in certain modes the DMA sporadically
+gives back the control to the CPU. For instance while the GPU is busy
+processing a command and won't accept any new input the DMA has to
+wait. Instead of wasting time it gives back control to the CPU to give
+it the opportunity to do something else.
+
+In order to emulate this behaviour correctly we need to emulate the
+GPU command FIFO, DMA timings and CPU timings correctly. Then we need
+to setup the state machine to switch between the CPU and DMA when
+needed. That would require quite some work to get right and we only
+have the BIOS boot logo to test it at this point.
+
+To avoid having to implement all that we're going to make a
+simplifying assumption for now: when the DMA runs it does all the
+transfer at once without giving back control to the CPU. This won't be
+exactly accurate but it should suffice to run the BIOS and hopefully
+some games.
+
+The reason I feel confident doing this simplification is that PCSX-R
+seems to do it that way and it can run quite many games, although some
+comments hint that it breaks with certain titles and it uses some
+hacks to improve compatibility. Mednafen on the other hand implements
+a much accurate DMA and actually emulates the DMA giving back the
+control to the CPU in certain situations, we'll probably want to do
+something similar later on.
+
+For now let's take a few steps back and revisit all the DMA register
+reads and writes done by the BIOS so that we can emulate them
+correctly.
 
 \newpage
 
