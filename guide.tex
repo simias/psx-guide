@@ -1500,23 +1500,38 @@ it's perfectly valid. As always we start by reading the bits [31:26]
 which obviously gives us \code{0b000000}. This value however can
 introduce a number of instructions, to figure out which one we need to
 read bits [5:0] which are again full zeroes. By looking at the
-instruction set reference we see that these value correspond to a SLL
-or ``Shift Left Logical''. If we decode the entire instruction we end
-up with:
+instruction set reference we see that these value correspond to a
+``shift left logical'' (SLL). If we decode the entire instruction we
+end up with:
 
 \begin{lstlisting}[language=assembly]
 sll $zero, $zero, 0
 \end{lstlisting}
 
-Obviously this instruction does absolutely nothing. For one storing in
-\$zero does nothing and shifting any register by 0 doesn't do anything
-either. This instruction (and its noticeable encoding as full 0s) is
-just the preferred way to encode a
-\href{https://en.wikipedia.org/wiki/NOP}{NOP}\footnote{MIPS assemblers
-  actually feature a \code{nop} pseudo-instruction that generates
-  this \mbox{\code{sll \$zero, \$zero, 0}} instruction.}. In this case I can
-only assume that it's waiting for the previous SW instructions to take
-effect but I'm not entirely sure why they are needed.
+Obviously this instruction does absolutely nothing since it stores the
+result in \$zero. This instruction is just the preferred way to encode
+a \href{https://en.wikipedia.org/wiki/NOP}{NOP}\footnote{MIPS
+  assemblers actually feature a \code{nop} pseudo-instruction that
+  generates this \mbox{\code{sll \$zero, \$zero, 0}} instruction.}.
+There are many instruction in the MIPS architecture that behave like
+NOPs, for instance using the opcodes we've already encountered we can
+craft several other NOPs:
+
+\begin{lstlisting}[language=assembly]
+lui $zero, 0
+ori $zero, $zero, 0
+ori $zero, $4, 1234
+\end{lstlisting}
+
+And there are many others since almost anything targeting \$zero is a
+NOP\footnote{One exception would be memory loads which can have side
+  effects even if the value is discarded in \$zero.}. I think the SLL
+version is preferred simply because it has this noticeable encoding of
+being all 0s.
+
+In this case I can only assume that the NOP is used as a delay,
+probably waiting for the previous SW instructions to take effect but
+I'm not entirely sure why it's needed.
 
 In our emulator we won't special-case this particular instruction, we
 can just implement the generic SLL instruction in full. Since NOPs are
@@ -1556,8 +1571,8 @@ impl Instruction {
 }
 \end{lstlisting}
 
-Now that we have our fancy getter to parse the instruction we can use it in
-our decoding function and the implementation is very straightforward:
+Now that we have our fancy getters ready to parse the instruction we
+can implement the opcode itself:
 
 \begin{lstlisting}
 impl Cpu {
@@ -1590,6 +1605,9 @@ impl Cpu {
     }
 }
 \end{lstlisting}
+
+Obviously in this case it won't do anything since it's a NOP but it
+should work correctly when we encounter a ``real'' SLL instruction.
 
 \subsection{ADDIU instruction}
 
