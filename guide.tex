@@ -6413,7 +6413,10 @@ impl Dma {
 \end{lstlisting}
 
 Then you'll have to plug those accessor methods in the interconnect as
-usual.
+usual\footnote{From now on I'm not going to bother putting the glue
+  code in the interconnect here when it's straightforward. If you're
+  having doubts you can look up the source code of the emulator in the
+  repository.}.
 
 \subsection{DMA Channel Control register}
 
@@ -6424,7 +6427,7 @@ usual.
     Field bits & Description \\
     \hline
     0         & Transfer direction: RAM-to-device(0) or device-to-RAM(1) \\
-    1         & Address increment or decrement mode \\
+    1         & Address increment(0) or decrement(1) mode \\
     2         & Chopping mode \\
     $[10:9]$  & Synchronization type: Manual(0), Request(1)
                 or Linked List(2) \\
@@ -6436,7 +6439,7 @@ usual.
   \end{tabular}
 
   \caption{DMA Channel Control register description}
-  \label{tab:dma_channel_control},
+  \label{tab:dma_channel_control}
 \end{table}
 
 The next DMA access is at offset \code{0x28}. This is the control
@@ -6466,12 +6469,12 @@ works in Manual sync mode or all the time. It doesn't really matter
 since we won't implement it for now.
 
 Finally bits [30:29] are read/write but I don't know what they
-do\footnote{the Nocash docs speculate that bit 29 might be used to
+do\footnote{The Nocash docs speculate that bit 29 might be used to
   pause an ongoing transfer but that will require some more testing.}.
 
 The current value of `0x401` sets the transfer direction to
 RAM-to-device and the sync mode to Linked List. It doesn't set bit
-`24` to enable the channel however so nothing happens\footnote{and
+`24` to enable the channel however so nothing happens\footnote{And
   it's a good thing since at that point no start address has been
   set!}.
 
@@ -6713,6 +6716,219 @@ Impl Interconnect {
 }
 \end{lstlisting}
 
+\subsection{DMA Base Address register}
+
+After that the BIOS writes \code{0x800eb8d4} to DMA register offset
+\code{0x60}. It means that the BIOS now moved to channel 6
+(\emph{Clear Ordering Table}) and sets the Base Address register. Only
+the low 24 bits are used since it's plenty enough to address the whole
+RAM. This one is pretty straightforward: it gives the address of the
+first word to be read or written in RAM. We can add it to our
+\code{struct Channel}:
+
+\begin{lstlisting}
+/// Per-channel data
+struct Channel {
+    //...
+
+    /// DMA start address
+    base: u32,
+}
+
+impl Channel {
+    //...
+
+    fn new() -> Channel {
+        Channel {
+            //...
+
+            base: 0,
+        }
+    }
+
+    /// Retrieve the channel's base address
+    pub fn base(&self) -> u32 {
+        self.base
+    }
+
+    /// Set channel base address. Only bits [0:23] are significant so
+    /// only 16MB are addressable by the DMA
+    pub fn set_base(&mut self, val: u32) {
+        self.base = val & 0xffffff;
+    }
+}
+\end{lstlisting}
+
+\subsection{DMA Block Control register}
+
+After plugging the base address methods in the interconnect we can
+proceed to our next DMA register access: it's the value
+\code{0x00000400} at offset \code{0x64}. This is our last unhandled
+DMA channel register: the Block Control. Its meaning depends on the
+synchronization type in the channel Control register (see
+table~\ref{tab:dma_channel_control}:
+
+\begin{itemize}
+\item In Manual sync mode only the low 16bits are used and they contain
+  the number of words to transfer.
+\item In Request sync mode the low 16 bits contain the block size in words
+  while the upper 16bits contain the number of blocks to transfer. The
+  DMA will transfer a block at a time and wait for the device to
+  assert the ``request'' flag before starting a new block.
+\item In Linked List mode this register is not used.
+\end{itemize}
+
+We can store the contents of this registers in two \code{u16}s:
+
+\begin{lstlisting}
+/// Per-channel data
+#[derive(Copy)]
+struct Channel {
+    //...
+
+    /// Size of a block in words
+    block_size: u16,
+    /// Block count, Only used when `sync` is `Request`
+    block_count: u16,
+}
+
+impl Channel {
+    //...
+
+    fn new() -> Channel {
+        Channel {
+            block_size: 0,
+            block_count: 0,
+        }
+    }
+
+    /// Retrieve value of the Block Control register
+    pub fn block_control(&self) -> u32 {
+        let bs = self.block_size as u32;
+        let bc = self.block_count as u32;
+
+        (bc << 16) | bs
+    }
+
+    /// Set value of the Block Control register
+    pub fn set_block_control(&mut self, val: u32) {
+        self.block_size = val as u16;
+        self.block_count = (val >> 16) as u16;
+    }
+}
+\end{lstlisting}
+
+We can see that the BIOS initialized a base address and block size for
+channel 6, it's no surprise that it then writes \code{0x11000002} to the
+channel control register.
+
+The configuration is Manual sync mode, towards the RAM, with
+decreasing addresses and it sets the enable and trigger bits to start
+the transfer.
+
+We can now implement the DMA copy itself but before we do so we must
+understand what this channel does exactly.
+
+\subsection{Depth Ordering Tables}
+
+DMA channel 6 is used to clear an ordering table in RAM. To understand
+what it means we need a little background on the Playstation graphics
+pipeline.
+
+The Playstation is an early 3D console and as such its 3D support is a
+bit spotty. In particular the GPU doesn't handle 3D primitives
+\emph{at all}. That might be surprising but as we'll see later the GPU
+can only draw 2 dimensional primitives like lines, triangles and
+rectangles in the framebuffer. There's no $Z$ coordinate and therefore
+no \href{https://en.wikipedia.org/wiki/Z-buffering}{z-buffer} or
+anything like that. If you have two overlapping triangles whichever is
+drawn last will appear on top of the other.
+
+That means that when a game wants to render a 3D scene it can't just
+create a
+\href{https://en.wikipedia.org/wiki/Vertex_Buffer_Object}{vertex
+  buffer} with 3D coordinates and have the GPU do the projection by
+itself since it can only rasterize 2D graphics. Instead the CPU must
+do the projection and send the draw commands \emph{in the right order}
+(that is, from farthest to closest from the point of view of the
+camera) to the GPU. This way closer objects will appear above more
+distant ones when they overlap.
+
+In order to do those computations more efficiently the CPU has a
+coprocessor called the ``Geometry Transfor Engine'' which can be used
+to project the primitives and compute their distance to the camera.
+
+All this code needs to be pretty efficient because in 3D games the
+camera's and objects' positions can change at every frame which means
+that the position of all primitives must potentially be recomputed
+every time. And in order to do this more efficiently the Playstation
+hardware supports a construct called ``depth ordering tables''.
+
+Let's consider a concrete example: a game wants to draw a cube. In
+order to do that it needs to render 6 quadrilaterals (or \emph{quads}
+for short), one for each side. Let's assume that the player can move
+around the cube so that the game doesn't know ahead of time which side
+will be facing the camera.
+
+We've seen that the game has to send the commands in the right order
+to the GPU otherwise the back side might appear in front for
+instance. That means that it must sort the primitives (the 6 quads)
+from back to front before sending the commands to the GPU.
+
+One possibility would be for the game to allocate a buffer big enough
+to contain all the draw commands for the current scene, fill it with
+all the projected primitives while sorting them in the correct
+order. If you want to draw a cube that's probably fine but for a
+complex scene with thousands of draw commands the CPU load will become
+huge, it'll spend its time sorting draw commands in RAM.
+
+Fortunately there's an other solution: in order to keep the draw
+commands ordered while not having to move things around all the time
+they're stored in a linked list. As you know inserting an entry
+between two elements in a linked list is very cheap: you just rewrite
+the element's list pointers and you're done.
+
+So here's how a depth ordering table is implemented: each command is
+stored in a ``packet'', somewhere in RAM. A packet starts with a 32bit
+``header'' word. The low 24bits of that word are the address of the
+next packet in RAM or \code{0xffffff} if it's the last item and the
+high 8bits are the number of words in the packet.
+
+You start with an empty table: you create an array of empty packets in
+RAM (only 32bit headers with the high 8bits set to 0 to indicate
+they're empty) and you make each entry point to the address of the
+previous one and the last one set to \code{0xffffff}. So you have a
+linked list of empty elements stored in an array in reverse
+order. Sounds silly but it's actually very handy.
+
+Now when the CPU wants to render a primitive it computes its distance
+to the camera, normalizes it over the size of the ordering table and
+uses it as an index. It can then take the value of the header at
+location in the table and insert the draw command in the list at that
+point. This way it doesn't have to iterate through the entire list to
+figure out where the primitive goes, the ordering table effectively
+works like a \href{https://en.wikipedia.org/wiki/Lookup_table}{lookup
+  table}.
+
+No matter the size of the scene, no matter how many elements have
+already been inserted in the list you can always insert a new draw
+command by creating a packet in ram, figuring out the depth index and
+updating two headers to insert yourself in the right order. The
+computing cost is constant.
+
+Of course, there can be collisions. Since there are only a finite
+number of positions in the depth ordering tables two or more packets
+can end up sharing the same slot. When that happens the newer element
+will point to the previous one and will therefore be drawn first
+(regardless of whether it's actually on front or behind). The smaller
+the table the smaller the granularity. That explains some of the
+visual glitches you can see in a lot of 3D games on the console, it's
+just a limitation of the hardware.
+
+Once the game has finished projecting and sorting the scene's draw
+command it can send it to the GPU by starting from the last entry in
+the depth ordering table and then iterating through the linked list
+until it reaches the \code{0xffffff} end-of-list marker.
 
 \newpage
 
