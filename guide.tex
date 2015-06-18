@@ -136,7 +136,7 @@ for grammar, syntax and typos are very welcome. Thank you!
 
 Ready? Let's begin!
 
-\section{The CPU and the memory}
+\section{The CPU: Instructions and the memory}
 
 \subsection{What is a CPU, anyway?}
 
@@ -6929,6 +6929,748 @@ Once the game has finished projecting and sorting the scene's draw
 command it can send it to the GPU by starting from the last entry in
 the depth ordering table and then iterating through the linked list
 until it reaches the \code{0xffffff} end-of-list marker.
+
+\subsection{DMA Clear Ordering Table channel}
+
+Enough theory, let's implement DMA channel 6. So far I've encapsulated
+all DMA-related code in the \code{Dma} and \code{Channel} structs,
+unfortunately putting the copy code itself in them is a bit
+troublesome in Rust. The problem is that this code needs to hold a
+reference to the various DMA-capable peripherals (RAM, GPU, SPU,
+etc\dots{}) but Rust adds a lot of constraints on references (and
+especially mutable references) to make sure the code is completely
+memory-safe.
+
+There are ways to work around that (using \code{RefCell}s, unsafe code
+etc\dots{}) but I don't want to bother with any of this so I'm just going
+to implement the copy code directly in the \code{Interconnect} since it
+already has access to all the peripherals.
+
+First, in the \code{set\_dma\_reg} function I'm going to check if a
+write to a DMA channel register activated it:
+
+\begin{lstlisting}
+impl Interconnect {
+//...
+
+    /// DMA register write
+    fn set_dma_reg(&mut self, offset: u32, val: u32) {
+        let major = (offset & 0x70) >> 4;
+        let minor = offset & 0xf;
+
+        let active_port =
+            match major {
+                // Per-channel registers
+                0...6 => {
+                    let port = Port::from_index(major);
+                    let channel = self.dma.channel_mut(port);
+
+                    match minor {
+                        0 => channel.set_base(val),
+                        4 => channel.set_block_control(val),
+                        8 => channel.set_control(val),
+                        _ =>
+                        panic!("Unhandled DMA write {:x}: {:08x}",
+                               offset, val)
+                    }
+
+                    if channel.active() {
+                        Some(port)
+                    } else {
+                        None
+                    }
+                },
+                // Common DMA registers
+                7 => {
+                    //...
+
+                    None
+                }
+                _ => panic!("Unhandled DMA write {:x}: {:08x}",
+                            offset, val),
+            };
+
+        if let Some(port) = active_port {
+            self.do_dma(port);
+        }
+    }
+}
+
+impl Channel {
+    //...
+
+    /// Return true if the channel has been started
+    pub fn active(&self) -> bool {
+        // In manual sync mode the CPU must set the "trigger" bit
+        // to start the transfer.
+        let trigger = match self.sync {
+            Sync::Manual => self.trigger,
+            _            => true,
+        };
+
+        self.enable && trigger
+    }
+}
+\end{lstlisting}
+
+Now the \code{Interconnect}'s \code{do\_dma} method will be called
+when a transfer must take place.
+
+The Manual and Request modes both copy blocks of data from/to the
+RAM. Linked List mode is a bit different since it hops around the RAM
+following the pointers in the headers. For this reason making a
+generic function to handle all three modes will be a bit tricky, I
+prefer to handle linked list separately:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Execute DMA transfer for a port
+    fn do_dma(&mut self, port: Port) {
+        // DMA transfer has been started, for now let's
+        // process everything in one pass (i.e. no
+        // chopping or priority handling)
+
+        match self.dma.channel(port).sync() {
+            Sync::LinkedList => panic!("Linked list mode unsupported"),
+            _                => self.do_dma_block(port),
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{DMA Block copy}
+
+We can now implement the block copy function itself. We start at the
+base address, we compute how many words we must copy by looking at the
+block control values. Then we enter the copy loop: depending on the
+copy direction we either read a word from RAM and send it to the
+device or the other way around.
+
+Since channel 6 is only used to initialize an ordering table we only
+need to implement the `ToRam` direction for now. Also the value copied
+into RAM doesn't come from an external peripheral, it's just generated
+by the DMA based on the current address:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    fn do_dma_block(&mut self, port: Port) {
+        let channel = self.dma.channel_mut(port);
+
+        let increment = match channel.step() {
+            Step::Increment =>  4,
+            Step::Decrement => -4,
+        };
+
+        let mut addr = channel.base();
+
+        // Transfer size in words
+        let mut remsz = match channel.transfer_size() {
+            Some(n) => n,
+            // Shouldn't happen since we shouldn't be reaching this
+            // code in linked list mode
+            None    =>
+              panic!("Couldn't figure out DMA block transfer size"),
+        };
+
+        while remsz > 0 {
+            // Not sure what happens if address is
+            // bogus... Mednafen just masks addr this way, maybe
+            // that's how the hardware behaves (i.e. the RAM
+            // address wraps and the two LSB are ignored, seems
+            // reasonable enough
+            let cur_addr = addr & 0x1ffffc;
+
+            match channel.direction() {
+                Direction::FromRam => panic!("Unhandled DMA direction"),
+                Direction::ToRam => {
+                    let src_word = match port {
+                        // Clear ordering table
+                        Port::Otc => match remsz {
+                            // Last entry contains the end
+                            // of table marker
+                            1 => 0xffffff,
+                            // Pointer to the previous entry
+                            _ => addr.wrapping_sub(4) & 0x1fffff,
+                        },
+                        _ => panic!("Unhandled DMA source port {}",
+                                    port as u8),
+                    };
+
+                    self.ram.store32(cur_addr, src_word);
+                }
+            }
+
+            addr = addr.wrapping_add(increment);
+            remsz -= 1;
+        }
+
+        channel.done();
+    }
+}
+
+impl Channel {
+    //...
+
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    pub fn step(&self) -> Step {
+        self.step
+    }
+
+    pub fn sync(&self) -> Sync {
+        self.sync
+    }
+
+    /// Return the DMA transfer size in bytes or None for linked
+    /// list mode.
+    pub fn transfer_size(&self) -> Option<u32> {
+        let bs = self.block_size as u32;
+        let bc = self.block_count as u32;
+
+        match self.sync {
+            // For manual mode only the block size is used
+            Sync::Manual => Some(bs),
+            // In DMA request mode we must transfer `bc` blocks
+            Sync::Request => Some(bc * bs),
+            // In linked list mode the size is not known ahead of
+            // time: we stop when we encounter the "end of list"
+            // marker (0xffffff)
+            Sync::LinkedList => None,
+        }
+    }
+
+    /// Set the channel status to "completed" state
+    pub fn done(&mut self) {
+        self.enable = false;
+        self.trigger = false;
+
+        // XXX Need to set the correct value for the other fields
+        // (in particular interrupts)
+    }
+}
+\end{lstlisting}
+
+Note the conditional to write \code{0xffffff} in the last iteration,
+it's of course important because otherwise the DMA won't find the end
+of table marker and start jumping randomly in RAM, sending crap to the
+GPU in the process.
+
+When the copy is done I call the \code{channel.done()} method which
+clears the \code{trigger} and \code{enable} flags. It should probably
+do more than that eventually, in particular it should trigger the
+interrupt if it's enabled. We'll leave that for later.
+
+We can now finally run our first DMA transfer in full! The BIOS sets
+the base address to \code{0x000eb8d4} and the block size to 1024
+before starting channel 6 and we then initialize an empty ordering
+table.
+
+After that the BIOS enters an infinite loop on the GPUSTAT
+register. This time it's waiting for bit 26 which is ``ready to
+receive command word''. We are going to set this bit by default and
+while we're at it we're also going to add bit 27 which is ``ready to
+send VRAM to CPU''. This way we should avoid locking the BIOS on this
+register in the future:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Load 32bit word at `addr`
+    pub fn load32(&self, addr: u32) -> u32 {
+        //...
+
+        if let Some(offset) = map::GPU.contains(abs_addr) {
+            return match offset {
+                // GPUSTAT: set bit 26, 27 28 to signal that the GPU
+                // is ready for DMA and CPU access. This way the BIOS
+                // won't dead lock waiting for an event that'll never
+                // come.
+                4 => 0x1c000000,
+                _ => 0,
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+With this modification the BIOS goes a little further and configures
+DMA channel 2 to send a Linked List to the GPU.
+
+\subsection{DMA Linked Lists}
+
+Navigating the linked list is pretty straightforward: the BIOS puts
+the address of the first list header is the DMA channel's base
+address. We read the high byte of the header to know the size of the
+packet (in words, not counting the header). Packets are continuous in
+RAM so the data follows the header word directly.
+
+Once the packet data has been sent to the device we look at the low
+24bits of the header. If it's \code{0xffffff} then we're done,
+otherwise it contains the address of the next header and we loop.
+
+I'm not sure about if linked list mode is supported only by channel 2
+(the GPU) or if it's available for other ports. As far as I can tell
+it's only ever used to send commands to the GPU however, I'll have to
+remember test that.
+
+By the way, interesting bit of information for us emulator writers: it
+seems that while the DMA offers a great deal of flexibility with a lot
+options and flags only a handful of configs are ever used for each
+channel. PCSX-R hardcodes those configs and simply ignores more exotic
+flag combinations (even though they're technically possible) and
+mednafen, while supporting most options, has an optimized fast path
+for the common configs. The Nocash's docs also lists those common
+configs (and the few odd variations in some games). It means that we
+can probably go a long way even if we don't support some obscure
+configurations.
+
+Here's what my simple linked list synchronization mode implementation
+looks like:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Execute DMA transfer for a port
+    fn do_dma(&mut self, port: Port) {
+        // DMA transfer has been started, for now let's
+        // process everything in one pass (i.e. no
+        // chopping or priority handling)
+
+        match self.dma.channel(port).sync() {
+                Sync::LinkedList => self.do_dma_linked_list(port),
+                _                => self.do_dma_block(port),
+        }
+    }
+
+    /// Emulate DMA transfer for linked list synchronization mode.
+    fn do_dma_linked_list(&mut self, port: Port) {
+        let channel = self.dma.channel_mut(port);
+
+        let mut addr = channel.base() & 0x1ffffc;
+
+        if channel.direction() == Direction::ToRam {
+            panic!("Invalid DMA direction for linked list mode");
+        }
+
+        // I don't know if the DMA even supports linked list mode
+        // for anything besides the GPU
+        if port != Port::Gpu {
+            panic!("Attempted linked list DMA on port {}",
+                   port as u8);
+        }
+
+        loop {
+            // In linked list mode, each entry starts with a
+            // "header" word. The high byte contains the number
+            //  of words in the "packet" (not counting the header
+            //  word)
+            let header = self.ram.load32(addr);
+
+            let mut remsz = header >> 24;
+
+            while remsz > 0 {
+                addr = (addr + 4) & 0x1ffffc;
+
+                let command = self.ram.load32(addr);
+
+                println!("GPU command {:08x}", command);
+
+                remsz -= 1;
+            }
+
+            // The end-of-table marker is usually 0xffffff but
+            // mednafen only checks for the MSB so maybe that's what
+            // the hardware does? Since this bit is not part of any
+            // valid address it makes some sense. I'll have to test
+            // that at some point...
+            if header & 0x800000 != 0 {
+                break;
+            }
+
+            addr = header & 0x1ffffc;
+        }
+
+        channel.done();
+    }
+}
+\end{lstlisting}
+
+Since we haven't implement the GPU yet I just display the command word
+without further processing. We'll have to hook our GPU rendering code
+here when it's done. Let's get a bit further in our DMA implementation
+before we start working on the GPU, don't have anything interesting to
+display yet.
+
+\subsection{RAM to device GPU block copy}
+
+After this the BIOS wants to do an other DMA transfer from the RAM
+towards the GPU but this time in Request synchronization mode. It
+probably wants to load a texture. Adding support for this in our
+\code{do\_dma\_block} function is quite trivial:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Emulate DMA transfer for Manual and Request synchronization
+    /// modes.
+    fn do_dma_block(&mut self, port: Port) {
+        //...
+
+        while remsz > 0 {
+            //...
+
+            match channel.direction() {
+                Direction::FromRam => {
+                    let src_word = self.ram.load32(cur_addr);
+
+                    match port {
+                        Port::Gpu => println!("GPU data {:08x}", src_word),
+                        _ => panic!("Unhandled DMA destination port {}",
+                                    port as u8),
+                    }
+                }
+		//...
+            }
+
+            addr = addr.wrapping_add(increment);
+            remsz -= 1;
+        }
+
+        channel.done();
+    }
+}
+\end{lstlisting}
+
+We still can't do much more than printing the raw GPU data but at
+least the DMA part seems to work as intended. If we try to interpret
+the GPU commands sent through the linked list we can guess what it's
+doing\footnote{I'll describe those GPU instructions in greater details
+  later when we'll implement them.}:
+
+\begin{itemize}
+\item First it displays a black quadrilateral that takes the whole screen
+  (command \code{0x28000000}). It does this several times.
+\item Then it appears to load a texture (maybe the background with the
+  text?)
+\item Then it draws the same quadrilateral again but with a dark-grey
+  color (command \code{0x28030303} where \code{0x030303} is a 24bit
+  BGR colour)
+\item Then it draws it again repetedly, slowly changing the colour to a
+  lighter grey, it looks like the ``fade-in'' effect at the very
+  beginning of the boot animation. (commands \code{0x28060606},
+  \code{0x28090909} etc\dots{} to \code{0x28b4b4b4})
+\item Then it adds three more draw commands: \code{0x380000b2} which
+  draws a shaded quadrilateral and two \code{0x300000b2} commands
+  which draw shaded triangles.
+\end{itemize}
+
+Then a little while after that we stumble upon an unhandled
+\code{store8} at address \code{0x1f801800} which is a CDROM drive
+register. I'm pleased we managed to get to that point with our bare
+bones emulator. We don't even support interrupts!
+
+But before we look at this CDROM business it's tempting to try to
+implement a basic GPU and display our first frames. After all it seems
+that our emulator manages to go through the entire first boot
+logo. It'll be more rewarding to see that than the hexadecimal debug
+dumps we've become accustomed to and it'll validate that our CPU is
+working correctly.
+
+\section{The GPU: Displaying the SCE logo animation}
+
+We're finally getting to the fun part: drawing on the screen. The
+objective of this part in twofold:
+
+\begin{itemize}
+\item We want to create a reasonably accurate internal representation
+  of the PSX GPU. Mainly we want to update the register values to
+  reflect the current GPU state instead of our current hardcoded
+  values. This will layout a basic GPU state machine that we'll
+  improve later when we'll implement video timings, interrupts and
+  other delicacies.
+
+\item We'll also implement a very simple and innacurate OpenGL
+  renderer. That'll give us the opportunity to implement some of the
+  very boring low level OpenGL boilerplate and we'll have some visual
+  feedback for debugging the rest of the emulator.
+\end{itemize}
+
+In order to do this we'll start back from the beginning, review all
+the GPU register accesses (both from the CPU and DMA) and attempt to
+implement them as best as we can.
+
+\subsection{GPUSTAT register}
+
+The GPU only has a single status register but it's packed full of
+miscelaneous information about the GPU state. It contains fields
+describing the texture mapping config, the video mode, the various
+``ready'' bits for the command FIFOs, the color mode etc\dots{}
+
+We can start by declaring the various variables holding all that
+state. In that end I'm going to create a whole bunch of new types in
+order to manipulate nice type-safe symbolic values instead of
+meaningless integers:
+
+\begin{lstlisting}
+pub struct Gpu {
+    /// Texture page base X coordinate (4 bits, 64 byte increment)
+    page_base_x: u8,
+    /// Texture page base Y coordinate (1bit, 256 line increment)
+    page_base_y: u8,
+    /// Semi-transparency. Not entirely sure how to handle that value
+    /// yet, it seems to describe how to blend the source and
+    /// destination colors.
+    semi_transparency: u8,
+    /// Texture page color depth
+    texture_depth: TextureDepth,
+    /// Enable dithering from 24 to 15bits RGB
+    dithering: bool,
+    /// Allow drawing to the display area
+    draw_to_display: bool,
+    /// Force "mask" bit of the pixel to 1 when writing to VRAM
+    /// (otherwise don't modify it)
+    force_set_mask_bit: bool,
+    /// Don't draw to pixels which have the "mask" bit set
+    preserve_masked_pixels: bool,
+    /// Currently displayed field. For progressive output this is
+    /// always Top.
+    field: Field,
+    /// When true all textures are disabled
+    texture_disable: bool,
+    /// Video output horizontal resolution
+    hres: HorizontalRes,
+    /// Video output vertical resolution
+    vres: VerticalRes,
+    /// Video mode
+    vmode: VMode,
+    /// Display depth. The GPU itself always draws 15bit RGB, 24bit
+    /// output must use external assets (pre-rendered textures, MDEC,
+    /// etc...)
+    display_depth: DisplayDepth,
+    /// Output interlaced video signal instead of progressive
+    interlaced: bool,
+    /// Disable the display
+    display_disabled: bool,
+    /// True when the interrupt is active
+    interrupt: bool,
+    /// DMA request direction
+    dma_direction: DmaDirection,
+}
+
+/// Depth of the pixel values in a texture page
+#[derive(Copy)]
+enum TextureDepth {
+    /// 4 bits per pixel
+    T4Bit = 0,
+    /// 8 bits per pixel
+    T8Bit = 1,
+    /// 15 bits per pixel
+    T15Bit = 2,
+}
+
+/// Interlaced output splits each frame in two fields
+#[derive(Copy)]
+enum Field {
+    /// Top field (odd lines).
+    Top = 1,
+    /// Bottom field (even lines)
+    Bottom = 0,
+}
+
+/// Video output horizontal resolution
+#[derive(Copy)]
+struct HorizontalRes(u8);
+
+impl HorizontalRes {
+    /// Create a new HorizontalRes instance from the 2 bit field `hr1`
+    /// and the one bit field `hr2`
+    fn from_fields(hr1: u8, hr2: u8) -> HorizontalRes {
+        let hr = (hr2 & 1) | ((hr1 & 3) << 1);
+
+        HorizontalRes(hr)
+    }
+
+    /// Retrieve value of bits [18:16] of the status register
+    fn into_status(self) -> u32 {
+        let HorizontalRes(hr) = self;
+
+        (hr as u32) << 16
+    }
+}
+
+/// Video output vertical resolution
+#[derive(Copy)]
+enum VerticalRes {
+    /// 240 lines
+    Y240Lines = 0,
+    /// 480 lines (only available for interlaced output)
+    Y480Lines = 1,
+}
+
+/// Video Modes
+#[derive(Copy)]
+enum VMode {
+    /// NTSC: 480i60H
+    Ntsc = 0,
+    /// PAL: 576i50Hz
+    Pal  = 1,
+}
+
+/// Display area color depth
+#[derive(Copy)]
+enum DisplayDepth {
+    /// 15 bits per pixel
+    D15Bits = 0,
+    /// 24 bits per pixel
+    D24Bits = 1,
+}
+
+/// Requested DMA direction.
+#[derive(Copy)]
+enum DmaDirection {
+    Off = 0,
+    Fifo = 1,
+    CpuToGp0 = 2,
+    VRamToCpu = 3,
+}
+\end{lstlisting}
+
+This is basically a direct translation of the GPUSTAT register
+fields. I must say that at that point I don't fully understand all of
+those variables and it's possible that we'll have to change this
+implementation or maybe simply rename some of them. It does however
+give us a foretaste of the various features/quirks of the Playstation
+GPU that we'll have to implement eventually if we want to make an
+accurate renderer. If some of those variables mean nothing to you
+don't worry, we'll review them all when we actually need them.
+
+I'm not entirely sure what's the GPU state at reset but I think the
+BIOS will reconfigure everything anyway. Let's assume that all the
+values are 0 on reset, except for the \code{display\_disabled} field:
+
+\begin{lstlisting}
+impl Gpu {
+    pub fn new() -> Gpu {
+        Gpu {
+            page_base_x: 0,
+            page_base_y: 0,
+            semi_transparency: 0,
+            texture_depth: TextureDepth::T4Bit,
+            dithering: false,
+            draw_to_display: false,
+            force_set_mask_bit: false,
+            preserve_masked_pixels: false,
+            field: Field::Top,
+            texture_disable: false,
+            hres: HorizontalRes::from_fields(0, 0),
+            vres: VerticalRes::Y240Lines,
+            vmode: VMode::Ntsc,
+            display_depth: DisplayDepth::D15Bits,
+            interlaced: false,
+            display_disabled: true,
+            interrupt: false,
+            dma_direction: DmaDirection::Off,
+        }
+    }
+}
+\end{lstlisting}
+
+For the time being we can implement the GPUSTAT register read. It's a
+read-only register since writes to the GPUSTAT register address end up
+in the GP1 register. We'll see how the GPU config is modified in a
+minute.
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Retrieve value of the status register
+    pub fn status(&self) -> u32 {
+        let mut r = 0u32;
+
+        r |= (self.page_base_x as u32) << 0;
+        r |= (self.page_base_y as u32) << 4;
+        r |= (self.semi_transparency as u32) << 5;
+        r |= (self.texture_depth as u32) << 7;
+        r |= (self.dithering as u32) << 9;
+        r |= (self.draw_to_display as u32) << 10;
+        r |= (self.force_set_mask_bit as u32) << 11;
+        r |= (self.preserve_masked_pixels as u32) << 12;
+        r |= (self.field as u32) << 13;
+        // Bit 14: not supported
+        r |= (self.texture_disable as u32) << 15;
+        r |= self.hres.into_status();
+        r |= (self.vres as u32) << 19;
+        r |= (self.vmode as u32) << 20;
+        r |= (self.display_depth as u32) << 21;
+        r |= (self.interlaced as u32) << 22;
+        r |= (self.display_disabled as u32) << 23;
+        r |= (self.interrupt as u32) << 24;
+
+        // For now we pretend that the GPU is always ready:
+        // Ready to receive command
+        r |= 1 << 26;
+        // Ready to send VRAM to CPU
+        r |= 1 << 27;
+        // Ready to receive DMA block
+        r |= 1 << 28;
+
+        r |= (self.dma_direction as u32) << 29;
+
+        // Bit 31 should change depending on the currently drawn
+        // line (whether it's even, odd or in the vblack
+        // apparently). Let's not bother with it for now.
+        r |= 0 << 31;
+
+        // Not sure about that, I'm guessing that it's the signal
+        // checked by the DMA in when sending data in Request
+        // synchronization mode. For now I blindly follow the
+        // Nocash spec.
+        let dma_request =
+            match self.dma_direction {
+                // Always 0
+                DmaDirection::Off => 0,
+                // Should be 0 if FIFO is full, 1 otherwise
+                DmaDirection::Fifo => 1,
+                // Should be the same as status bit 28
+                DmaDirection::CpuToGp0 => (r >> 28) & 1,
+                // Should be the same as status bit 27
+                DmaDirection::VRamToCpu => (r >> 27) & 1,
+            };
+
+        r |= dma_request << 25;
+
+        r
+    }
+}
+\end{lstlisting}
+
+You can see that I don't support bit 14: the Nocash spec says that
+when this bit is set on the real hardware just messes up the display
+in a weird way. We can probably assume that it's not a commonly used
+feature for the moment.
+
+As before I hardcode the ``ready'' bits to 1 since we have a long way
+to go before we have the necessary infrastructure to emulate them
+accurately. We'll need to emulate the various internal FIFOs and the
+rate at which they empty for instance. That will come later.
+
+In general I'm not entirely sure how the DMA state machine
+synchronizes with the GPU. We'll have to hope it's not too critical
+for now. As we progress if we start to notice that our emulator seems
+to misbehave because of a broken GPU DMA we'll have to investigate
+further.
+
+\subsection{GP0 command register}
 
 \newpage
 
