@@ -23,7 +23,8 @@
    morecomment=[s]{/*}{*/},%
    morecomment=[l]//,%
    morestring=[b]",%
-   morestring=[b]',%
+%   morestring=[b]', Unfortunately lifetimes also use this and it
+%   breaks
   }[keywords,comments,strings]
 
 \lstdefinelanguage{assembly}%
@@ -5275,7 +5276,7 @@ impl Interconnect {
 }
 \end{lstlisting}
 
-\subsubsection{GP0 register}
+\subsubsection{GP0: Draw Mode Setting command}
 
 Very soon after that we get an unhandled \code{write32} at address
 \code{0x1f801810}. This is the other GPU register address. This one is
@@ -7670,7 +7671,1269 @@ for now. As we progress if we start to notice that our emulator seems
 to misbehave because of a broken GPU DMA we'll have to investigate
 further.
 
-\subsection{GP0 command register}
+\subsection{GP0 Dram Mode Setting command}
+
+All the GPU configuration and draw commands are transferred through
+two registers: GP0 and GP1. GP0 is used to send drawing commands
+(lines, triangles, quadrilaterals with various attributes) and to copy
+data between the VRAM (the video RAM dedicated to the GPU) and the
+CPU/DMA.
+
+We'll have to decode those command like we decoded the CPU
+instructions. The format is pretty simple: the most significant byte
+is the ``opcode'' and the rest are parameters whose meaning depends on
+the opcode. The only difficulty is that GP0 commands can take a
+variable amount of parameters and therefore fit in multiple words.
+
+The first command sent by the BIOS into GP0 is \code{0xe1003000}. The
+high byte is \code{0xe1} which is the ``Draw Mode setting''
+command. It sets a bunch of texture-related values (dithering, texture
+depth, texture disable, etc\dots{}) and two new fields we haven't
+already encountered in the GPUSTAT register:
+\code{rectangle\_texture\_x\_flip} and
+\code{rectangle\_texture\_y\_flip}. They're used to mirror a textured
+rectangle horizontally or vertically:
+
+\begin{lstlisting}
+pub struct Gpu {
+    //...
+
+    /// Mirror textured rectangles along the x axis
+    rectangle_texture_x_flip: bool,
+    /// Mirror textured rectangles along the y axis
+    rectangle_texture_y_flip: bool,
+}
+
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP0 command register
+    pub fn gp0(&mut self, val: u32) {
+        let opcode = (val >> 24) & 0xff;
+
+        match opcode {
+            0xe1 => self.gp0_draw_mode(val),
+            _    => panic!("Unhandled GP0 command {:08x}", val),
+        }
+    }
+
+    /// GP0(0xE1) command
+    fn gp0_draw_mode(&mut self, val: u32) {
+        self.page_base_x = (val & 0xf) as u8;
+        self.page_base_y = ((val >> 4) & 1) as u8;
+        self.semi_transparency = ((val >> 5) & 3) as u8;
+
+        self.texture_depth =
+            match (val >> 7) & 3 {
+                0 => TextureDepth::T4Bit,
+                1 => TextureDepth::T8Bit,
+                2 => TextureDepth::T15Bit,
+                n => panic!("Unhandled texture depth {}", n),
+            };
+
+        self.dithering = ((val >> 9) & 1) != 0;
+        self.draw_to_display = ((val >> 10) & 1) != 0;
+        self.texture_disable = ((val >> 11) & 1) != 0;
+        self.rectangle_texture_x_flip = ((val >> 12) & 1) != 0;
+        self.rectangle_texture_y_flip = ((val >> 13) & 1) != 0;
+    }
+}
+\end{lstlisting}
+
+We can now call our new \code{gp0} method from the interconnect:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Store 32bit word `val` into `addr`
+    pub fn store32(&mut self, addr: u32, val: u32) {
+        //...
+
+        if let Some(offset) = map::GPU.contains(abs_addr) {
+            match offset {
+                0 => self.gpu.gp0(val),
+                _ => panic!("GPU write {}: {:08x}", offset, val),
+            }
+            return;
+        }
+
+        //...
+    }
+}
+\end{lstlisting}
+
+\subsection{GP0 NOP command}
+
+The next GP0 command sent by the BIOS is `0x0007920c`. Apparently
+opcode `0x00` is a NOP so I'm not sure what's the meaning of the
+`0x7920c` given as parameter\footnote{I've tried quickly disassembling
+  the surrounding code but I couldn't really figure out what it's
+  trying to do. I'll have to take the time to dig deeper at some
+  point\dots{}}. Maybe it's just a garbage value. Let's ignore it for
+now and implement the NOP:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP0 command register
+    pub fn gp0(&mut self, val: u32) {
+        let opcode = (val >> 24) & 0xff;
+
+        match opcode {
+            0x00 => (), // NOP
+            0xe1 => self.gp0_draw_mode(val),
+            _    => panic!("Unhandled GP0 opcode {:08x}", val),
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{GP1 Soft Reset command}
+
+After that the BIOS writes \code{0x00000000} to GP1 this time. The
+command format is the same: the high byte is the opcode while the low
+24bits contain the parameters. However GP1 has a different set of
+commands mostly used to configure the display and the DMA. GP1
+commands are always one word in length.
+
+GP1 opcode \code{0x00} is a software reset command, it resets the GPU
+to a default configuration. It reconfigures most of the fields we've
+already encountered and a few more:
+
+\begin{lstlisting}
+pub struct Gpu {
+    //...
+
+    /// Texture window x mask (8 pixel steps)
+    texture_window_x_mask: u8,
+    /// Texture window y mask (8 pixel steps)
+    texture_window_y_mask: u8,
+    /// Texture window x offset (8 pixel steps)
+    texture_window_x_offset: u8,
+    /// Texture window y offset (8 pixel steps)
+    texture_window_y_offset: u8,
+    /// Left-most column of drawing area
+    drawing_area_left: u16,
+    /// Top-most line of drawing area
+    drawing_area_top: u16,
+    /// Right-most column of drawing area
+    drawing_area_right: u16,
+    /// Bottom-most line of drawing area
+    drawing_area_bottom: u16,
+    /// Horizontal drawing offset applied to all vertex
+    drawing_x_offset: i16,
+    /// Vertical drawing offset applied to all vertex
+    drawing_y_offset: i16,
+    /// First column of the display area in VRAM
+    display_vram_x_start: u16,
+    /// First line of the display area in VRAM
+    display_vram_y_start: u16,
+    /// Display output horizontal start relative to HSYNC
+    display_horiz_start: u16,
+    /// Display output horizontal end relative to HSYNC
+    display_horiz_end: u16,
+    /// Display output first line relative to VSYNC
+    display_line_start: u16,
+    /// Display output last line relative to VSYNC
+    display_line_end: u16,
+}
+\end{lstlisting}
+
+I tried to get the reset value from my console, unfortunately some of
+the values like \code{display\_horiz\_*} and \code{display\_line\_*}
+cannot be read directly from any register as far as I can tell so I'm
+going to use the values given by the NoCash specs instead.
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP1 command register
+    pub fn gp1(&mut self, val: u32) {
+        let opcode = (val >> 24) & 0xff;
+
+        match opcode {
+            0x00 => self.gp1_reset(val),
+            _    => panic!("Unhandled GP1 command {:08x}", val),
+        }
+    }
+
+    /// GP1(0x00): soft reset
+    fn gp1_reset(&mut self, _: u32) {
+        self.interrupt = false;
+
+        self.page_base_x = 0;
+        self.page_base_y = 0;
+        self.semi_transparency = 0;
+        self.texture_depth = TextureDepth::T4Bit;
+        self.texture_window_x_mask = 0;
+        self.texture_window_y_mask = 0;
+        self.texture_window_x_offset = 0;
+        self.texture_window_y_offset = 0;
+        self.dithering = false;
+        self.draw_to_display = false;
+        self.texture_disable = false;
+        self.rectangle_texture_x_flip = false;
+        self.rectangle_texture_y_flip = false;
+        self.drawing_area_left = 0;
+        self.drawing_area_top = 0;
+        self.drawing_area_right = 0;
+        self.drawing_area_bottom = 0;
+        self.drawing_x_offset = 0;
+        self.drawing_y_offset = 0;
+        self.force_set_mask_bit = false;
+        self.preserve_masked_pixels = false;
+
+        self.dma_direction = DmaDirection::Off;
+
+        self.display_disabled = true;
+        self.display_vram_x_start = 0;
+        self.display_vram_y_start = 0;
+        self.hres = HorizontalRes::from_fields(0, 0);
+        self.vres = VerticalRes::Y240Lines;
+
+        self.vmode = VMode::Ntsc;
+        self.interlaced = true;
+        self.display_horiz_start = 0x200;
+        self.display_horiz_end = 0xc00;
+        self.display_line_start = 0x10;
+        self.display_line_end = 0x100;
+        self.display_depth = DisplayDepth::D15Bits;
+
+        // XXX should also clear the command FIFO when we implement it
+        // XXX should also invalidate GPU cache if we ever implement it
+    }
+}
+\end{lstlisting}
+
+The reset command is supposed to flush the command FIFO and the
+texture cache but we don't emulate those yet so I just added a note to
+remember to modify the function when we add support for one of those.
+
+The \code{texture\_window\_*} parameters are used to crop a texture. The
+\code{drawing\_area\_*} parameters are used to describe a drawing window, the
+GPU won't draw anything outside of this area.
+
+The \code{drawing\_offset\_*} parameters are a constant offset that's
+added to all the vertex. It lets you translate a scene in VRAM without
+having to recompute all the coordinates on the CPU.
+
+The \code{display\_vram\_*}, \code{display\_horiz\_*} and
+\code{display\_line\_*} parameters are used to describe which portion
+of the VRAM are drawn on the screen. If you're not familiar with the
+wonderful world of analog video it might not be immediately obvious
+what those parameters do so let me give a quick overview of the GPU's
+video output.
+
+\subsection{The GPU renderer and the video output}
+
+You can think of the Playstation GPU as two different modules
+operating asynchronously. First you have t he renderer which take the
+draw commands (through GP0) and
+\href{https://en.wikipedia.org/wiki/Rasterisation}{rasterizes} them
+into the dedicated video memory used by the GPU: the VRAM.
+
+The VRAM is organized as a two dimensional byte array whose dimensions
+are 2048x512, giving a grand total of 1MB of video memory. This VRAM
+is used to store the image generated by the GPU's rasterizer (i.e. the
+\href{https://en.wikipedia.org/wiki/Framebuffer}{framebuffer}) but
+also any texture used to render the scene. The GPU has no direct
+access to the main RAM, much less the CDROM: all the assets have to be
+copied in VRAM by the CPU or DMA before the rendering can take place.
+
+Once the renderer has completed a scene it ends up somewhere in the
+VRAM. Now it has to be displayed on the TV screen. That's where the
+GPU's video output is used.
+
+The video output (when enabled) sends the video signal continuously at
+60 \href{https://en.wikipedia.org/wiki/NTSC}{NTSC} or 50
+\href{https://en.wikipedia.org/wiki/PAL}{PAL} frames per second. It
+never stops because doing so would cause a glitch on the
+screen. Consider the
+\href{https://en.wikipedia.org/wiki/Cathode_ray_tube}{CRT} displays
+everybody used in the nineties: you have an electron beam sweeping the
+screen line by line, you can't jump to any random position of the
+screen when you want. Even on modern LCD screens most video interfaces
+(VGA, DVI, HDMI, LVDS, MIPI,...) behave in the same way.
+
+That means that when the game wants to draw a triangle on the screen
+it doesn't directly send the triangle to the TV, rather it renders it
+in the framebuffer and the video output will send it to the screen
+during its next pass.
+
+For the time being we won't bother emulating the video output, we can
+directly display the contents of the framebuffer. It's not accurate
+but it's simpler and we should be able to plug our video output
+emulation layer on top of it when we're ready to implement it.
+
+\subsection{GPUREAD register placeholder}
+
+After those commands the BIOS reads from the register at offset 0 in
+the GPU (the same address where GP0 commands are written). This
+register is GPUREAD and is used to retrieve data generated by certain
+commands, typically to read parts of the framebuffer back in RAM. The
+problem is that so far no such command has been issued so I'm not sure
+why the BIOS attempts to read from there. For now let's return 0 and
+we'll implement it properly later:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Retrieve value of the "read" register
+    pub fn read(&self) -> u32 {
+        // Not implemented for now...
+        0
+    }
+}
+\end{lstlisting}
+
+\subsection{GP1 Display Mode command}
+
+The BIOS goes on by sending command \code{0x08000000} in GP1. Opcode
+\code{0x08} sets the display mode: video mode, screen resolution,
+interlacing etc... It also sets that weird field which we encountered
+as bit 14 of GPUSTAT: the one who appears to mess up the video
+output. I'm going to assume this field is useless so I'm just going to
+crash if it's set, this way if one game relies on it we're sure to
+catch it:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP1(0x80): Display Mode
+    fn gp1_display_mode(&mut self, val: u32) {
+        let hr1 = (val & 3) as u8;
+        let hr2 = ((val >> 6) & 1) as u8;
+
+        self.hres = HorizontalRes::from_fields(hr1, hr2);
+
+        self.vres = match val & 0x4 != 0 {
+            false => VerticalRes::Y240Lines,
+            true  => VerticalRes::Y480Lines,
+        };
+
+        self.vmode = match val & 0x8 != 0 {
+            false => VMode::Ntsc,
+            true  => VMode::Pal,
+        };
+
+        self.display_depth = match val & 0x10 != 0 {
+            false => DisplayDepth::D24Bits,
+            true  => DisplayDepth::D15Bits,
+        };
+
+        self.interlaced = val & 0x20 != 0;
+
+        if val & 0x80 != 0 {
+            panic!("Unsupported display mode {:08x}", val);
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{GP1 DMA direction command}
+
+After that the BIOS issues the GP1 command \code{0x04000000}. Opcode
+\code{0x04} simply sets the DMA direction (to \code{Off} in this
+case):
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP1(0x04): DMA Direction
+    fn gp1_dma_direction(&mut self, val: u32) {
+        self.dma_direction =
+            match val & 3 {
+                0 => DmaDirection::Off,
+                1 => DmaDirection::Fifo,
+                2 => DmaDirection::CpuToGp0,
+                3 => DmaDirection::VRamToCpu,
+                _ => unreachable!(),
+            };
+    }
+}
+\end{lstlisting}
+
+\subsection{DMA GP0 commands}
+
+After that the CPU issues an other ``DMA Direction'' command to set it
+to value 2 (\code{CpuToGp0}). After that the BIOS starts sending the
+Linked List commands using the DMA. Those commands are always sent to
+GP0 so we can update our linked list DMA routine to call the
+\code{gp0} method of our GPU:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Emulate DMA transfer for linked list synchronization mode.
+    fn do_dma_linked_list(&mut self, port: Port) {
+        //...
+
+        loop {
+            //...
+
+            while remsz > 0 {
+                addr = (addr + 4) & 0x1ffffc;
+
+                let command = self.ram.load32(addr);
+
+                // Send command to the GPU
+                self.gpu.gp0(command);
+
+                remsz -= 1;
+            }
+	    //...
+        }
+        //...
+    }
+}
+\end{lstlisting}
+
+\subsection{GP0 Set Drawing Area commands}
+
+The first command sent through the linked list is \code{0xe3000400}
+which sets the top-left corner of the drawing area. When the GPU
+renderer draws to the framebuffer it won't write anything outside of
+the drawing area even if a draw command clips outside.
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0xE3): Set Drawing Area top left
+    fn gp0_drawing_area_top_left(&mut self, val: u32) {
+        self.drawing_area_top = ((val >> 10) & 0x3ff) as u16;
+        self.drawing_area_left = (val & 0x3ff) as u16;
+    }
+}
+\end{lstlisting}
+
+You see that the \code{drawing\_area\_top} value can range from 0 to
+1023. It's strange because the GPU VRAM only has 512 lines so anything
+beyond that value won't be rendered. The horizontal coordinate,
+\code{drawing\_area\_left}, has the same resolution but this one is
+normal: the VRAM has 2048 bytes per lines but since the GPU draws 16
+bits per pixel (15bit RGB + mask bit) you can only fit 1024 pixels
+per VRAM line.
+
+Unsuprisingly the next command is \code{0xe403c27f} which sets the
+bottom-right corner of the drawing area, the parameter packing is the
+same:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0xE4): Set Drawing Area bottom right
+    fn gp0_drawing_area_bottom_right(&mut self, val: u32) {
+        self.drawing_area_bottom = ((val >> 10) & 0x3ff) as u16;
+        self.drawing_area_right = (val & 0x3ff) as u16;
+    }
+}
+\end{lstlisting}
+
+After those two commands the top-left corder is at [0, 1] while the
+bottom-right is at [639, 240]. The coordinates are inclusive so the
+drawing area resolution is 640x240 which looks like a standard NTSC
+field resolution.
+
+\subsection{GP0 Set Drawing Offset command}
+
+The BIOS continues setting the drawing area with
+command \code{0xe5000800} which sets the drawing offset. We have
+to be careful with that one because the x and y parameters are 11 bit
+\emph{signed} two's complement values. It means that the GPU can
+handle negative offsets. We need to mess with a few bit shifts to get
+the correct sign extension for negative values\footnote{The reason is
+  that Rust obviously doesn't have a 11bit signed integer type so we
+  have to shift to 16bits in order to get the correct sign in an
+  \code{i16}, then we can shift back to 11bits.}:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0xE5): Set Drawing Offset
+    fn gp0_drawing_offset(&mut self, val: u32) {
+        let x = (val & 0x7ff) as u16;
+        let y = ((val >> 11) & 0x7ff) as u16;
+
+        // Values are 11bit two's complement signed values, we need to
+        // shift the value to 16bits to force sign extension
+        self.drawing_x_offset = ((x << 5) as i16) >> 5;
+        self.drawing_y_offset = ((y << 5) as i16) >> 5;
+    }
+}
+\end{lstlisting}
+
+This particular command sets the offset to [0, 1] which matches the
+drawing area top-left corner so everything is coherent so far. I'm not
+sure why the BIOS doesn't start at [0, 0] but I guess wasting one line
+doesn't matter much for displaying the boot logo.
+
+\subsection{GP0 Texture Window command}
+
+After that we have yet another GPU config command: \code{0xe2000000}
+which configures the texture window parameters:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0xE2): Set Texture Window
+    fn gp0_texture_window(&mut self, val: u32) {
+        self.texture_window_x_mask = (val & 0x1f) as u8;
+        self.texture_window_y_mask = ((val >> 5) & 0x1f) as u8;
+        self.texture_window_x_offset = ((val >> 10) & 0x1f) as u8;
+        self.texture_window_y_offset = ((val >> 15) & 0x1f) as u8;
+    }
+}
+\end{lstlisting}
+
+\subsection{GP0 Mask Bit Setting command}
+
+The BIOS continues with the last GP0 rendering attribute command:
+\code{e6000000}` which sets the mask bit-related parameters:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0xE6): Set Mask Bit Setting
+    fn gp0_mask_bit_setting(&mut self, val: u32) {
+        self.force_set_mask_bit = (val & 1) != 0;
+        self.preserve_masked_pixels = (val & 2) != 0;
+    }
+}
+\end{lstlisting}
+
+The mask bit behaves a bit like OpenGL's stencil masks, it prevents
+the GPU from overwriting a pixel if its mask bit is set and masking is
+enabled.
+
+\subsection{GP1 Display VRAM Start command}
+
+The BIOS then configures the video output through the GP1 register. It
+starts with \code{0x0503c400} which sets the display start address in
+VRAM.
+
+Note that the LSB of the horizontal coordinate is ignored. It means
+that we're always aligned to a 16bit pixel.
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP1(0x05): Display VRAM Start
+    fn gp1_display_vram_start(&mut self, val: u32) {
+        self.display_vram_x_start = (val & 0x3fe) as u16;
+        self.display_vram_y_start = ((val >> 10) & 0x1ff) as u16;
+    }
+}
+\end{lstlisting}
+
+The current command sets the start coordinates to [0, 241] which is
+immediately below the drawing area we configured before. I assume it's
+because the BIOS will use a form of double buffering and won't draw
+directly to the displayed area.
+
+\subsection{GP1 Display Range commands}
+
+After the display VRAM start address the BIOS configures the video
+output timings with commands \code{0x06c60260} and \code{0x0703fc10}
+which respectively set the display's horizontal and vertical
+range\footnote{Those coordinates are not in VRAM but rather in the
+  output's video signal system of coordinates.}:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP1(0x06): Display Horizontal Range
+    fn gp1_display_horizontal_range(&mut self, val: u32) {
+        self.display_horiz_start = (val & 0xfff) as u16;
+        self.display_horiz_end   = ((val >> 12) & 0xfff) as u16;
+    }
+
+    /// GP1(0x07): Display Vertical Range
+    fn gp1_display_vertical_range(&mut self, val: u32) {
+        self.display_line_start = (val & 0x3ff) as u16;
+        self.display_line_end   = ((val >> 10) & 0x3ff) as u16;
+    }
+}
+\end{lstlisting}
+
+Note that those commands use a different packing format for their
+parameters.
+
+\subsection{GP0 Monochrome Quadrilateral command}
+
+We're finally getting to the interesting part: the first draw
+command. The BIOS sends a linked list to the GPU containing command
+\code{0x28000000}. GP0 opcode \code{0x28} draws a monochrome
+quadrilateral. The low 3bytes of the command contain the 24bit BGR
+color of the polygon (black in this case).
+
+There's a problem however: this command takes 4 additional words as
+argument containing the coordinates of the 4
+\href{https://en.wikipedia.org/wiki/Vertex_%28geometry%29}{vertex}
+needed to draw a quadrilateral. So far we've only implemented
+single-word GP0 commands so we'll have to improve our code a little.
+
+To simplify our task I'm going to start with a simple container that
+will accumulate the words for the current command:
+
+\begin{lstlisting}
+/// Buffer holding multi-word fixed-length GP0 command parameters
+struct CommandBuffer {
+    /// Command buffer: the longuest possible command is GP0(0x3E)
+    /// which takes 12 parameters
+    buffer: [u32; 12],
+    /// Number of words queued in buffer
+    len:    u8,
+}
+
+impl CommandBuffer {
+    fn new() -> CommandBuffer {
+        CommandBuffer {
+            buffer: [0; 12],
+            len:    0,
+        }
+    }
+
+    /// Clear the command buffer
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn push_word(&mut self, word: u32) {
+        self.buffer[self.len as usize] = word;
+
+        self.len += 1;
+    }
+}
+
+impl ::std::ops::Index<usize> for CommandBuffer {
+    type Output = u32;
+
+    fn index<'a>(&'a self, index: usize) -> &'a u32 {
+        if index >= self.len as usize {
+            panic!("Command buffer index out of range: {} ({})",
+                   index, self.len);
+        }
+
+        &self.buffer[index]
+    }
+}
+\end{lstlisting}
+
+It's just a glorified array which can contain up to 12 words and keeps
+the count of how many words have been pushed into it. The
+\code{std::ops::Index} mumbo jumbo just overloads the [] operator to
+let us access \code{CommandBuffer} elements like a regular array.
+
+We can add an instance of this CommandBuffer to our GPU state and
+we'll also add a counter of the number of remaining parameters and a
+function pointer to the method which implements the command (it will
+save us having to \code{match} the opcode twice):
+
+\begin{lstlisting}
+pub struct Gpu {
+    //...
+
+    /// Buffer containing the current GP0 command
+    gp0_command: CommandBuffer,
+    /// Remaining words for the current GP0 command
+    gp0_command_remaining: u32,
+    /// Pointer to the method implementing the current GP) command
+    gp0_command_method: fn(&mut Gpu),
+}
+\end{lstlisting}
+
+We can now modify our GP0 register handler to use this new
+infrastructure:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP0 command register
+    pub fn gp0(&mut self, val: u32) {
+        if self.gp0_command_remaining == 0 {
+            // We start a new GP0 command
+            let opcode = (val >> 24) & 0xff;
+
+            let (len, method) =
+                match opcode {
+                    0x00 =>
+                        (1, Gpu::gp0_nop
+                            as fn(&mut Gpu)),
+                    0x28 =>
+                        (5, Gpu::gp0_quad_mono_opaque
+                            as fn(&mut Gpu)),
+                    0xe1 =>
+                        (1, Gpu::gp0_draw_mode
+                            as fn(&mut Gpu)),
+                    0xe2 =>
+                        (1, Gpu::gp0_texture_window
+                            as fn(&mut Gpu)),
+                    0xe3 =>
+                        (1, Gpu::gp0_drawing_area_top_left
+                            as fn(&mut Gpu)),
+                    0xe4 =>
+                        (1, Gpu::gp0_drawing_area_bottom_right
+                            as fn(&mut Gpu)),
+                    0xe5 =>
+                        (1, Gpu::gp0_drawing_offset
+                            as fn(&mut Gpu)),
+                    0xe6 =>
+                        (1, Gpu::gp0_mask_bit_setting
+                            as fn(&mut Gpu)),
+                    _ => panic!("Unhandled GP0 command {:08x}",
+                                val),
+                };
+
+            self.gp0_command_remaining = len;
+            self.gp0_command_method = method;
+
+            self.gp0_command.clear();
+        }
+
+        self.gp0_command.push_word(val);
+        self.gp0_command_remaining -= 1;
+
+        if self.gp0_command_remaining == 0 {
+            // We have all the parameters, we can run the command
+            (self.gp0_command_method)(self);
+        }
+    }
+
+    /// GP0(0x00): No Operation
+    fn gp0_nop(&mut self) {
+        // NOP
+    }
+}
+\end{lstlisting}
+
+We're still missing the implementation of the
+\code{gp0\_quad\_mono\_opaque} function that's supposed to render the
+primitive in the framebuffer. We could start drawing to the screen
+right away but since we only have a black rectangle so far it wouldn't
+be very interesting. Let's put a placeholder for now and continue a
+little further before we fire up OpenGL:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0x28): Monochrome Opaque Quadrilateral
+    fn gp0_quad_mono_opaque(&mut self) {
+        println!("Draw quad");
+    }
+}
+\end{lstlisting}
+
+\subsection{Interleaved video deadlock workaround}
+
+Unfortunately when we attempt to continue the execution to get to the
+next GPU commands we enter an infinite loop in the BIOS. That's weird,
+especially since we got way past that point before we started
+implementing the GPU.
+
+If we disassemble the code at the deadlock location we discover that
+the BIOS is apparently waiting for bit 31 of the GPUSTAT register to
+change. This bit is supposed to alternate between odd and even lines
+when the output is
+\href{https://en.wikipedia.org/wiki/Interlaced_video}{interlaced}). But
+we haven't implemented this bit yet.
+
+So why did it work before? After some testing it turns out it's
+because this particular piece of code is only entered when GPUSTAT
+retuns bit 19 set, i.e. when the vertical resolution is set to 480
+lines. Paradoxically by implementing the GPUSTAT register and
+improving the accuracy of our emulator we caused a regression.
+
+I'm not entirely sure what this particular piece of BIOS code does to
+be honest, to figure it out I'd have to disassemble a bigger chunk of
+surrounding code to figure out what it's trying to do and I don't want
+to go down this rabbit hole at that point. I'd rather implement bit
+31 of GPUSTAT correctly but in order to do that we need accurate GPU
+timings and we don't have that yet.
+
+In that light and in order to keep us moving we're going to use a
+temporary hack: in the GPUSTAT register we're going to return 0 in bit
+19 no matter what. It's not accurate but it will side step that
+problemetic piece of code. When we implement GPU timings and emulate
+bit 31 correctly we'll revert that change:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Retrieve value of the status register
+    pub fn status(&self) -> u32 {
+        let mut r = 0u32;
+
+        //...
+        r |= self.hres.into_status();
+        // XXX Temporary hack: if we don't emulate bit 31 correctly
+        // setting `vres` to 1 locks the BIOS:
+        // r |= (self.vres as u32) << 19;
+        r |= (self.vmode as u32) << 20;
+	//...
+    }
+}
+\end{lstlisting}
+
+This is not very satisfactory of course but that should allow us to
+keep going with our first GPU implementation. Soon after that we'll
+start working on accurate timings and we'll be able to emulate bit 31
+properly.
+
+\subsection{GP0 Clear Cache command}
+
+We can now resume the BIOS execution and we reach a new GP0 command:
+\code{0x01000000}. This command is used to clear the internal texture
+cache. Since we don't implement a texture cache yet we can just ignore
+this command for now:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0x01): Clear Cache
+    fn gp0_clear_cache(&mut self) {
+        // Not implemented
+    }
+}
+\end{lstlisting}
+
+\subsection{GP0 Load Image command}
+
+Next we have GP0 command \code{0xa0000000} which is used to load an
+image into the GPU's VRAM using the CPU or the DMA. This is how a
+program can load a texture or a palette into the GPU's dedicated
+memory.
+
+The command takes two additional word parameters: the first one
+contains the coordinates of the top-left corner of target rectangle in
+the VRAM. The 2nd one contains the resolution of the image
+(width/heigh) in pixels. The GPU then expects the pixel data on the
+same GP0 port.
+
+Since the GPU uses 16bits pixels and the CPU/DMA send 32bits at a time
+to the GP0 port an additional 16bits of padding must be added in the
+total number of pixels is odd.
+
+Since this command is immediately followed by the image data the total
+amount of data transfered can be quite big, storing all of it in our
+\code{gp0\_command} buffer to copy it all in the VRAM afterwards would
+be wasteful. Instead we are going to special case image transfer to
+store the data directly inside the VRAM.
+
+I add a new variable in the GPU state holding the current mode of the
+GP0 port:
+
+\begin{lstlisting}
+pub struct Gpu {
+    //...
+
+    /// Current mode of the GP0 register
+    gp0_mode: Gp0Mode,
+}
+
+impl Gpu {
+    pub fn new() -> Gpu {
+        Gpu {
+            //...
+
+            gp0_mode: Gp0Mode::Command,
+        }
+    }
+
+    //...
+}
+
+/// Possible states for the GP0 command register
+enum Gp0Mode {
+    /// Default mode: handling commands
+    Command,
+    /// Loading an image into VRAM
+    ImageLoad,
+}
+\end{lstlisting}
+
+I also renamed \code{gp0\_command\_remaining} into
+\code{gp0\_words\_remaining} since it will also count the remaining
+number of image words to load.
+
+We can then tweak the \code{gp0} method to handle this new mode:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP0 command register
+    pub fn gp0(&mut self, val: u32) {
+        if self.gp0_words_remaining == 0 {
+            // We start a new GP0 command
+            let opcode = (val >> 24) & 0xff;
+
+            let (len, method) =
+                match opcode {
+                    //...
+                    0xa0 =>
+                        (3, Gpu::gp0_image_load as fn(&mut Gpu)),
+                    //...
+                };
+
+            self.gp0_words_remaining = len;
+            self.gp0_command_method = method;
+
+            self.gp0_command.clear();
+        }
+
+        self.gp0_words_remaining -= 1;
+
+        match self.gp0_mode {
+            Gp0Mode::Command => {
+                self.gp0_command.push_word(val);
+
+                if self.gp0_words_remaining == 0 {
+                    // We have all the parameters, we can run
+                    // the command
+                    (self.gp0_command_method)(self);
+                }
+            }
+            Gp0Mode::ImageLoad => {
+                // XXX Should copy pixel data to VRAM
+
+                if self.gp0_words_remaining == 0 {
+                    // Load done, switch back to command mode
+                    self.gp0_mode = Gp0Mode::Command;
+                }
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+I added the \code{gp0\_image\_load} command which I consider to be 3
+words long. The method uses those parameters to compute the number of
+words we must expect as part of the image data and puts it back in
+\code{gp0\_words\_remaining} while switching \code{gp0\_mode} to
+\code{ImageLoad}:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0XA0): Image Load
+    fn gp0_image_load(&mut self) {
+        // Parameter 2 contains the image resolution
+        let res = self.gp0_command[2];
+
+        let width  = res & 0xffff;
+        let height = res >> 16;
+
+        // Size of the image in 16bit pixels
+        let imgsize = width * height;
+
+        // If we have an odd number of pixels we must round up
+        // since we transfer 32bits at a time. There'll be 16bits
+        // of padding in the last word.
+        let imgsize = (imgsize + 1) & !1;
+
+        // Store number of words expected for this image
+        self.gp0_words_remaining = imgsize / 2;
+
+        // Put the GP0 state machine in ImageLoad mode
+        self.gp0_mode = Gp0Mode::ImageLoad;
+    }
+}
+\end{lstlisting}
+
+Of course in my \code{gp0} implementation above I don't actually do
+anything with the image data. When we add support for the VRAM
+emulation we should copy the image data at the right location (given
+by the first command parameter) but there's no reason to bother with
+that at that point.
+
+\subsection{DMA image transfer}
+
+The BIOS doesn't send the image data in a linked list like other GP0
+commands, instead it uses a regular ``block'' DMA transfer so we need
+to plug our \code{gp0} method in it:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Emulate DMA transfer for Manual and Request synchronization
+    /// modes.
+    fn do_dma_block(&mut self, port: Port) {
+        //...
+
+        while remsz > 0 {
+            //...
+
+            match channel.direction() {
+                Direction::FromRam => {
+                    let src_word = self.ram.load32(cur_addr);
+
+                    match port {
+                        Port::Gpu => self.gpu.gp0(src_word),
+                        _ =>
+                        panic!("Unhandled DMA destination port {}",
+                               port as u8),
+                    }
+                }
+                //...
+            }
+
+            //...
+        }
+
+        //...
+    }
+}
+\end{lstlisting}
+
+Our emulator now loads textures to the GPU and then discards them
+immediately. Beautiful.
+
+\subsection{GP1 Display Enable command}
+
+After that the bios issues GP1 command \code{0x03000000} which is used
+to set the value of of our \code{display\_disabled} field:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP1(0x03): Display Enable
+    fn gp1_display_enable(&mut self, val: u32) {
+        self.display_disabled = val & 1 != 0;
+    }
+}
+\end{lstlisting}
+
+In this case it sets it to 0, effectively enabling the display.
+
+\subsection{GP0 Image Store command}
+
+Then the BIOS does something quite perplexing: it issues a
+\code{0xc0000000} command on GP0 which is used to copy data
+\emph{from} the VRAM to the CPU/DMA. The parameters are the same as
+the ``Load Image'' command but this time it's the GPU providing the
+pixel data through the GPUREAD register. The CPU (or DMA) can then
+read the data 32bits at a time by reading this register until all the
+image has been transfered.
+
+I find it perplexing because I can't imagine what the BIOS is trying
+to do here. Since it hasn't rendered anything worthwhile yet it
+doesn't have anything interesting to recover. Maybe it's part of a
+self-test of some sort.
+
+We could try to figure it out by disassembling the code that calls
+this command but I don't want to bother with that. I'm just going to
+foolishly ignore it for now. Whatever this code is doing doesn't seem
+to prevent the BIOS from continuing its execution normally (it gets
+through the boot animation and starts probing the CDROM). So let's use
+a placeholder implementation for now:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0xC0): Image Store
+    fn gp0_image_store(&mut self) {
+        // Parameter 2 contains the image resolution
+        let res = self.gp0_command[2];
+
+        let width  = res & 0xffff;
+        let height = res >> 16;
+
+        println!("Unhandled image store: {}x{}", width, height);
+    }
+}
+\end{lstlisting}
+
+We don't have to do anything more: after this command the BIOS will
+expect the image data to be available through the GPUREAD
+register. Right now our implementation of this register always returns
+0 so it will read that as many times as it wants.
+
+\subsection{GP0 Shaded Quadrilateral command}
+
+At long last we're reaching the interesting part! The BIOS is starting
+to draw the boot animation with the ``Sony Computer Entertainment''
+logo. We're only missing a few commands before we can proceed to
+implement the OpenGL renderer itself.
+
+The first one is \code{0x380000b2} which draws a \emph{shaded}
+quadrilateral. It means that unlike the previous quad command this one
+takes one color \emph{per vertex} and fills the shape with a
+\href{https://en.wikipedia.org/wiki/Gouraud_shading}{Gouraud shading}
+which creates a gradient between those values. We'll see that this
+type of shading is trivial to implement in OpenGL.
+
+This command takes 8 parameters: 4 vertex position and their assorted
+colors. As for the other drawing commands let's put a placeholder for
+the moment:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP0 command register
+    pub fn gp0(&mut self, val: u32) {
+        if self.gp0_words_remaining == 0 {
+            //...
+
+            let (len, method) =
+                match opcode {
+                    //...
+                    0x38 =>
+                        (8, Gpu::gp0_quad_shaded_opaque
+                            as fn(&mut Gpu)),
+                    //...
+                };
+            //...
+        }
+        //...
+    }
+
+    /// GP0(0x38): Shaded Opaque Quadrilateral
+    fn gp0_quad_shaded_opaque(&mut self) {
+        println!("Draw quad shaded");
+    }
+}
+\end{lstlisting}
+
+\subsection{GP0 Shaded Triangle command}
+
+After that we get to the GP0 command \code{0x300000b2}. This command
+is almost identical to the one before except that it draws a triangle
+instead of a quad. As such it only takes 6 parameters (3
+position/color couples):
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP0 command register
+    pub fn gp0(&mut self, val: u32) {
+        if self.gp0_words_remaining == 0 {
+            //...
+
+            let (len, method) =
+                match opcode {
+                    //...
+                    0x30 =>
+                        (6, Gpu::gp0_triangle_shaded_opaque
+                            as fn(&mut Gpu)),
+                    //...
+                };
+            //...
+        }
+        //...
+    }
+
+    /// GP0(0x30): Shaded Opaque Triangle
+    fn gp0_triangle_shaded_opaque(&mut self) {
+        println!("Draw triangle shaded");
+    }
+}
+\end{lstlisting}
+
+\subsection{GP0 Textured Quadrilateral With Color Blending command}
+
+Our last drawing command for the moment will be \code{0x2c808080}
+which is the fanciest yet: it draws a quadrilateral, maps a texture on
+it while blending it with a solid color. It takes 9 parameters:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// Handle writes to the GP0 command register
+    pub fn gp0(&mut self, val: u32) {
+        if self.gp0_words_remaining == 0 {
+            //...
+
+            let (len, method) =
+                match opcode {
+                    //...
+                    0x2c =>
+                        (9, Gpu::gp0_quad_texture_blend_opaque
+                            as fn(&mut Gpu)),
+                    //...
+                };
+            //...
+        }
+        //...
+    }
+
+    /// GP0(0x2C): Textured Opaque Quadrilateral
+    fn gp0_quad_texture_blend_opaque(&mut self) {
+        println!("Draw quad texture blending");
+    }
+}
+\end{lstlisting}
+
+\subsection{GP1 Acknowledge Interrupt command}
+
+Once the BIOS has finished displaying the boot logo it attempts to
+acknowledge the GPU interrupt by issuing the GP1 command
+\code{0x02000000}. Of course in our current implementation we never
+trigger the interrupt in the first place but we might as well add a
+simple implementation anyway:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP1(0x02): Acknowledge Interrupt
+    fn gp1_acknowledge_irq(&mut self) {
+        self.interrupt = false;
+    }
+}
+\end{lstlisting}
+
+\subsection{GP1 Reset Command Buffer command}
+
+And we finish this sequence with GP1 command \code{0x01000000} which
+clears the command FIFO. We don't implement the FIFO itself yet but we
+can at least reset the GP0 state machine to a default state:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP1(0x01): Reset Command Buffer
+    fn gp1_reset_command_buffer(&mut self) {
+        self.gp0_command.clear();
+        self.gp0_words_remaining = 0;
+        self.gp0_mode = Gp0Mode::Command;
+        // XXX should also clear the command FIFO when we
+        // implement it
+    }
+}
+\end{lstlisting}
+
+I take the opportunity add a call to this function in
+\code{gp1\_reset} since it should also clear the command buffer.
+
+And that's it! We have our entire GPU command sequence to display the
+boot logo. Now we can implement a basic OpenGL renderer to visualize
+it all.
 
 \newpage
 
