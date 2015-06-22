@@ -4,6 +4,7 @@
 \usepackage{listings}
 \usepackage{color}
 \usepackage{microtype}
+\usepackage{graphicx}
 
 \lstdefinelanguage{Rust}%
   {
@@ -49,6 +50,22 @@
    morestring=[b]",%
    morestring=[b]',%
   }[keywords,comments,strings]
+
+\lstdefinelanguage{glsl}%
+  {
+   morekeywords={void,main,in,out,float,%
+                 vec2,vec3,vec4,%
+                 ivec2,ivec3,ivec4,%
+                 uvec2,uvec3,uvec4,%
+                 xyzw,x,y,z,w,%
+                 rgba,r,g,b,a,%
+                },%
+   sensitive,%
+   morecomment=[s]{/*}{*/},%
+   morecomment=[l]//,%
+   moredelim=*[directive]\#,%
+   moredirectives={version}%
+  }[keywords,comments,strings,directives]
 
 \definecolor{comment}{rgb}{0,0.6,0}
 \definecolor{string}{rgb}{0.58,0,0.82}
@@ -7386,7 +7403,7 @@ logo. It'll be more rewarding to see that than the hexadecimal debug
 dumps we've become accustomed to and it'll validate that our CPU is
 working correctly.
 
-\section{The GPU: Displaying the SCE logo animation}
+\section{The GPU: Internal state and first commands}
 
 We're finally getting to the fun part: drawing on the screen. The
 objective of this part in twofold:
@@ -8935,8 +8952,974 @@ And that's it! We have our entire GPU command sequence to display the
 boot logo. Now we can implement a basic OpenGL renderer to visualize
 it all.
 
+\section{The GPU: Basic OpenGL renderer for the boot logo}
+
+For our first renderer we're not going to bother with the Video
+Display: since the GPU's internal video memory has a total resolution
+of 1024x512 we'll just display all of the framebuffer at once and draw
+the primitives directly on the screen. We just need to take the draw
+commands, render them in our framebuffer in the native internal
+resolution and display it all. Easy.
+
+The first step is to create a window and retreive an OpenGL context to
+draw in it. OpenGL itself doesn't handle things like window creations
+since that's system specific. There are many libraries out there to
+take care of that (\href{http://www.glfw.org/}{GLFW},
+\href{http://freeglut.sourceforge.net/}{freeglut}, etc\dots{}). For my
+emulator I opted for the \href{http://libsdl.org/}{SDL2} library,
+mainly because I'm familiar with it. I'll also use this library to
+handle controller input and, later on, sound support.
+
+If for some reason you prefer to use an other library (or libraries)
+to handle these system-spefic interfaces rest assured that it won't
+change anything to the OpenGL code itself, just the window setup code.
+
+\subsection{Window and OpenGL context creation}
+
+Here's the code for creating a window and recovering its OpenGL
+context with the SDL2:
+
+\begin{lstlisting}
+use sdl2;
+use sdl2::video::{OPENGL, WindowPos};
+use sdl2::video::GLAttr::GLContextMajorVersion;
+use sdl2::video::GLContextMinorVersion;
+use gl;
+use libc::c_void;
+
+pub struct Renderer {
+    sdl_context: sdl2::sdl::Sdl,
+    window: sdl2::video::Window,
+    gl_context: sdl2::video::GLContext,
+}
+
+impl Renderer {
+
+    pub fn new() -> Renderer {
+        let sdl_context = sdl2::init(::sdl2::INIT_VIDEO).unwrap();
+
+        sdl2::video::gl_set_attribute(GLContextMajorVersion, 3);
+        sdl2::video::gl_set_attribute(GLContextMinorVersion, 3);
+
+        let window = sdl2::video::Window::new(
+                                     &sdl_context,
+                                     "PSX",
+                                     WindowPos::PosCentered,
+                                     WindowPos::PosCentered,
+                                     1024, 512,
+                                     PENGL).unwrap();
+
+        let gl_context = window.gl_create_context().unwrap();
+
+        gl::load_with(|s|
+                      sdl2::video::gl_get_proc_address(s).unwrap()
+                      as *const c_void);
+
+        Renderer {
+            sdl_context: sdl_context,
+            window: window,
+            gl_context: gl_context,
+        }
+    }
+}
+\end{lstlisting}
+
+The function \code{sdl2::init} calls the global SDL2 initialization
+routine. For now we're only using the \code{VIDEO} subsystem. In the
+SDL2 C API this function doesn't return anything but the rust bindings
+return an object that's used to call \code{SDL\_Quit} automatically
+when it's destroyed. In C you have to call \code{SDL\_Quit} explicitly
+when your program exits (or whenever you don't need the SDL anymore).
+
+After that the two \code{gl\_set\_attribute} calls say that we're
+going to use OpenGL 3.3\footnote{At the time of writing OpenGL 4.5 is
+  the latest version but 3.3 is more widely supported and should
+  suffice for what we're doing although we may end up using a couple
+  extensions.}.
+
+Then \code{Window::new} creates the window itself with a resolution of
+1024x512 (the resolution of the VRAM) and OpenGL support. I named the
+window ``PSX'' because I don't have any imagination.
+
+We can retreive the window's OpenGL context with the
+\code{gl\_create\_context} method and then we must load the
+\href{https://www.opengl.org/wiki/Load_OpenGL_Functions}{OpenGL
+  function pointers}. You don't really need to understand that part in
+details, it's some glue between the OpenGL and SDL libraries, you just
+need to make sure it's done before we start calling OpenGL commands.
+
+Finally we store the SDL context, window and OpenGL context in the
+newly created Renderer object. We need to put an instance of this
+struct in our GPU:
+
+\begin{lstlisting}
+pub struct Gpu {
+    //...
+
+    /// OpenGL renderer
+    renderer: opengl::Renderer,
+}
+
+impl Gpu {
+    pub fn new() -> Gpu {
+        Gpu {
+            //...
+            renderer: opengl::Renderer::new(),
+        }
+    }
+}
+\end{lstlisting}
+
+If everything works well our emulator should now create a window when
+starting up. The window's contents are garbage however (on my system
+it contains a chunk of the screen). We can clear it by issuing the
+following calls:
+
+\begin{lstlisting}
+impl Renderer {
+
+    pub fn new() -> Renderer {
+        //...
+
+        // Clear the window
+        unsafe {
+            gl::ClearColor(0., 0., 0., 1.0);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+        }
+
+        window.gl_swap_window();
+
+        Renderer {
+            //...
+        }
+    }
+}
+\end{lstlisting}
+
+The \code{unsafe} keyword is there because as far as Rust is concerned
+all OpenGL calls are a C foreign function interface and are therefore
+potentially memory unsafe. The \code{ClearColor}\footnote{The OpenGL C
+  API concatenates the ``gl'' prefix to symbols (``GL\_'' for macros)
+  so in C \code{ClearColor} would be \code{glClearColor} and
+  \code{COLOR\_BUFFER\_BIT} would be
+  \code{GL\_COLOR\_BUFFER\_BIT}. When searching for an OpenGL symbol
+  online it's sometimes better to use the C form.}function sets the
+clear color (duh): the first three parameters are the red, green and
+blue components and the fourth is the alpha parameter. They all are
+floating point integers in the range [0.0, 1.0]. In this case all the
+color components are 0.0 so the color is black and alpha is set to 1.0
+which means it's fully opaque.
+
+The \code{Clear} function then applies this color to the entire color
+buffer. You'll notice that we just give the type of buffer we want to
+clear as parameter, not a handle to a specific buffer. That's the way
+most of the OpenGL API works: you ``bind'' various types of object to
+an implicit global context and the subsequent function calls act on
+the currently bound object of for a given type. In this case we
+haven't bound anything ourselves, by default the color buffer will be
+the window's framebuffer.
+
+The \code{gl\_swap\_window} forces a window update and displays the
+result of the previous commands. With this addition the window should
+now appear completely black. Progress!
+
+\subsection{Drawing the primitives}
+
+Now let's do something more interesting: drawing the primitives. This
+is the part where we'll have to write a whole lot of OpenGL glue so
+take a deep breath and dive in.
+
+Let's choose a primitive to start with, I've decided to use
+GP0(0x30),the gouraud shaded triangle. It's a simple shape with some
+basic shading. It has three vertex, each having a position in VRAM and
+a color. Let's create structs to hold those attributes in a
+shader-friendly fashion:
+
+\begin{lstlisting}
+/// Position in VRAM.
+#[derive(Copy,Clone,Default,Debug)]
+pub struct Position(pub GLshort, pub GLshort);
+
+impl Position {
+    /// Parse position from a GP0 parameter
+    pub fn from_gp0(val: u32) -> Position {
+        let x = val as i16;
+        let y = (val >> 16) as i16;
+
+        Position(x as GLshort, y as GLshort)
+    }
+}
+
+/// RGB color
+#[derive(Copy,Clone,Default,Debug)]
+pub struct Color(pub GLubyte, pub GLubyte, pub GLubyte);
+
+impl Color {
+    /// Parse color from a GP0 parameter
+    pub fn from_gp0(val: u32) -> Color {
+        let r = val as u8;
+        let g = (val >> 8) as u8;
+        let b = (val >> 16) as u8;
+
+        Color(r as GLubyte, g as GLubyte, b as GLubyte)
+    }
+}
+\end{lstlisting}
+
+I store the \code{Position} as a pair of of \code{GLshort}s, OpenGL's
+signed 16bit integer type. The color is stored as a triplet of
+unsigned bytes, \code{GLubyte}. Internally OpenGL uses floats for
+screen coordinates and colors but we'll be able to make the conversion
+in the shaders.
+
+We can use these new types to create two arrays: one will contain the
+three vertex positions of the triangle in VRAM, the other the
+associated colors:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0x30): Shaded Opaque Triangle
+    fn gp0_triangle_shaded_opaque(&mut self) {
+        let positions = [
+            Position::from_gp0(self.gp0_command[1]),
+            Position::from_gp0(self.gp0_command[3]),
+            Position::from_gp0(self.gp0_command[5]),
+            ];
+
+        let colors = [
+            Color::from_gp0(self.gp0_command[0]),
+            Color::from_gp0(self.gp0_command[2]),
+            Color::from_gp0(self.gp0_command[4]),
+            ];
+
+        self.renderer.push_triangle(positions, colors);
+    }
+}
+\end{lstlisting}
+
+Now we need to implement this \code{push\_triangle} method that will
+put the attributes in a list of vertex to render. That's where the fun
+begins.
+
+First we need to setup somme buffers to hold the data. There are
+several ways to send data to the GPU, I've decided to go with
+persistently mapped buffers. The idea is that we're going to ask
+OpenGL to allocate some memory that will be shared between the GPU and
+us. We'll fill it with our data and when we're ready we'll tell the
+GPU to use it to draw the scene. Easy.
+
+To avoid duplicating a bunch of code let's make a generic
+\code{Buffer} struct holding an attribute buffer and its mapping:
+
+\begin{lstlisting}
+// Write only buffer with enough size for VERTEX_BUFFER_LEN elements
+pub struct Buffer<T> {
+    /// OpenGL buffer object
+    object: GLuint,
+    /// Mapped buffer memory
+    map: *mut T,
+}
+
+impl<T: Copy + Default> Buffer<T> {
+    /// Create a new buffer bound to the current vertex array
+    /// object.
+    pub fn new() -> Buffer<T> {
+        let mut object = 0;
+        let mut memory;
+
+        unsafe {
+            // Generate the buffer object
+            gl::GenBuffers(1, &mut object);
+
+            // Bind it
+            gl::BindBuffer(gl::ARRAY_BUFFER, object);
+
+            // Compute the size of the buffer
+            let element_size = size_of::<T>() as GLsizeiptr;
+            let buffer_size = element_size * VERTEX_BUFFER_LEN as GLsizeiptr;
+
+            // Write only persistent mapping. Not coherent!
+            let access = gl::MAP_WRITE_BIT | gl::MAP_PERSISTENT_BIT;
+
+            // Allocate buffer memory
+            gl::BufferStorage(gl::ARRAY_BUFFER,
+                              buffer_size,
+                              ptr::null(),
+                              access);
+
+            // Remap the entire buffer
+            memory = gl::MapBufferRange(gl::ARRAY_BUFFER,
+                                        0,
+                                        buffer_size,
+                                        access) as *mut T;
+
+            // Reset the buffer to 0 to avoid hard-to-reproduce bugs
+            // if we do something wrong with unitialized memory
+            let s = slice::from_raw_parts_mut(memory,
+                                              VERTEX_BUFFER_LEN as usize);
+
+            for x in s.iter_mut() {
+                *x = Default::default();
+            }
+        }
+
+        Buffer {
+            object: object,
+            map: memory,
+        }
+    }
+
+    /// Set entry at `index` to `val` in the buffer.
+    pub fn set(&mut self, index: u32, val: T) {
+        if index >= VERTEX_BUFFER_LEN {
+            panic!("buffer overflow!");
+        }
+
+        unsafe {
+            let p = self.map.offset(index as isize);
+
+            *p = val;
+        }
+    }
+}
+
+impl<T> Drop for Buffer<T> {
+    fn drop(&mut self) {
+        unsafe {
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.object);
+            gl::UnmapBuffer(gl::ARRAY_BUFFER);
+            gl::DeleteBuffers(1, &self.object);
+        }
+    }
+}
+
+/// Maximum number of vertex that can be stored in an attribute
+/// buffers
+const VERTEX_BUFFER_LEN: u32 = 64 * 1024;
+\end{lstlisting}
+
+That's a lot of code to simply allocate a buffer! Let's walk through
+it:
+
+\begin{itemize}
+\item First \code{GenBuffers} creates a new buffer object. That
+  doesn't allocate the buffer memory, it basically just creates a
+  handle.
+
+\item This handle is then bound with \code{BindBuffer}, from then on the
+  commands targetting \code{ARRAY\_BUFFER} will use this buffer.
+
+\item We must then compute the size of the buffer in bytes. I've
+  decided to hardcode the length of the buffer in
+  \code{VERTEX\_BUFFER\_LEN}, ideally it should be big enough to hold
+  an entire scene (otherwise we'll have to make several draw calls per
+  frame), but not too big in order not to waste memory. We'll probably
+  want to better tune that constant later.
+
+\item Once we know how much room we need we can ask OpenGL to allocate
+  it for us. We request \code{MAP\_WRITE\_BIT} since we want to
+  write-only access to the buffer and \code{MAP\_PERSISTENT\_BIT} to
+  be able to hold the mapping persistently (instead of having to remap
+  it for each frame).
+
+\item Now we can retreive a pointer to this memory location using
+  \code{MapBufferRange} to remap the buffer in the process' address
+  space.
+
+\item To make debugging easier if we mess something up I then reset
+  the buffer's memory to zero. This way if we attempt to draw an unused
+  part of the buffer by mistake we'll still have a well defined
+  behaviour instead of drawing random unitialized data.
+
+\item The \code{set} method will be used to store an entry in the
+  buffer.
+
+\item The \code{Drop} destructor will cleanup everything when we're
+  done.
+\end{itemize}
+
+We can add our two buffers to the \code{Renderer} right now but
+creating buffers without having any shaders to render them isn't very useful.
+
+\subsection{The vertex shader}
+
+If you're not familiar with the concept of
+\href{https://en.wikipedia.org/wiki/Shader}{shaders} you should take
+the time to read about them a little before we continue. Basically
+they're programs executed by various GPU stages. We'll only need two
+shaders for now: the vertex shader and the fragment shader.
+
+The vertex shader is the first programmable stage in the OpenGL
+pipeline. It will receive the vertex coordinates and the colors from
+our attribute buffers. It'll have to convert them from the Playstation
+VRAM representation to the one used by OpenGL and pass them on to the
+next stage:
+
+\begin{lstlisting}[language=glsl]
+#version 330 core
+
+in ivec2 vertex_position;
+in uvec3 vertex_color;
+
+out vec3 color;
+
+void main() {
+  // Convert VRAM coordinates (0;1023, 0;511) into
+  // OpenGL coordinates (-1;1, -1;1)
+  float xpos = (float(vertex_position.x) / 512) - 1.0;
+  // VRAM puts 0 at the top, OpenGL at the bottom,
+  // we must mirror vertically
+  float ypos = 1.0 - (float(vertex_position.y) / 256);
+
+  gl_Position.xyzw = vec4(xpos, ypos, 0.0, 1.0);
+
+  // Convert the components from [0;255] to [0;1]
+  color = vec3(float(vertex_color.r) / 255,
+	       float(vertex_color.g) / 255,
+	       float(vertex_color.b) / 255);
+}
+\end{lstlisting}
+
+OpenGL shader language, also called
+\href{https://en.wikipedia.org/wiki/OpenGL_Shading_Language}{GLSL},
+looks a bit like C but don't let that fool you, it's actually quite
+different. For one you can see that the parameters and return values
+are not given in the \code{main} prototype, instead they're given at
+the global scope as \code{in} and \code{out} parameters.
+
+We have two \code{in} parameters: the vertex position (a pair of
+signed integers) and its color (a triplet of unsigned integers). The
+\code{main} function is called once for each vertex. Our triangle as
+three vertices so it'll be called 3 times.
+
+The shader sets two output variables: \code{color} (a triplet of three
+floats) and
+\href{https://www.opengl.org/sdk/docs/man4/html/gl_Position.xhtml}{\code{gl\_Position}}
+which is a a builtin GLSL variable, a vector of four floats. The last
+two components of \code{gl\_Position} are the \code{z} (depth)
+coordinate which is always 0 for us since we're drawing in 2D and the
+\code{w} parameter (the homogeneous component) which should be 1.0 for
+a position. This last parameter is used for
+\href{https://en.wikipedia.org/wiki/Transformation_matrix#Perspective_projection}{perspective
+  correct projection}\footnote{If you're not familiar with
+  \href{https://en.wikipedia.org/wiki/Homogeneous_coordinates}{homogeneous
+    coordinates} don't worry, all you have to know for now is that you
+  have to set the \code{w} component to 1.0 for a position and 0.0 for
+  a vector.}.
+
+You can see that the OpenGL horizontal and vertical screen coordinates
+go from -1.0 to 1.0 (no matter the actual resolution of the screen)
+and that the vertical coordinates go in the opposite direction than
+the Playstation VRAM addressing. OpenGL colors are also floats in the
+range [0.0, 1.0].
+
+You can see that our vertex shader does all the work of converting
+coordinates and colors from the Playstation internal representation to
+the OpenGL format. In general we'll want to offload as much
+computation as possible to the GPU since I'm expecting the emulation
+bottleneck to be on the CPU.
+
+After all Playstation graphics are extremely simple compared to modern
+games, for instance modern GPUs have gigabytes worth of video RAM
+compared to the Playstation's puny 2MB. Even if we enhance the
+graphics significantly our graphic cards shouldn't break a sweat if
+we're careful not to write extremely poorly optimized shader code.
+
+\subsection{The fragment shader}
+
+Once the primitive passed through the vertex shader it will be
+rasterized\footnote{There are actually a couple more stages before
+  that in modern OpenGL like the tesselation and geometry shaders but
+  we don't need to bother with that.}. In the rasterization process
+the triangle primitive is converted into individual fragments. In our
+case the fragments will be the individual screen pixels but with
+multisampling enabled you can get several fragments per pixels that
+get averaged to produce the final pixel value.
+
+For each fragment in the rasterized primitive the GPU then runs the
+fragment shader whose job is to produce the fragment's color:
+
+\begin{lstlisting}[language=glsl]
+#version 330 core
+
+in vec3 color;
+out vec4 frag_color;
+
+void main() {
+    frag_color = vec4(color, 1.0);
+}
+\end{lstlisting}
+
+Pretty straightforward: the output color \code{frag\_color} (the name
+is arbitrary) takes the value of the input attribute \code{color} and
+a fourth value which is the
+\href{https://en.wikipedia.org/wiki/Alpha_compositing}{alpha channel}
+to handle transparent pixels. In our case the pixels are fully opaque
+so it's hardcoded to 1.0.
+
+If you're not familiar with OpenGL you're probably puzzled, what's the
+value of this \code{color} parameter exactly? A triangle has three
+vertices, potentially each with a different color, so which one do we
+get here?
+
+What happens is that in this case OpenGL tells the GPU to interpolate
+the value of the color based on its distance to the three vertices and
+their respective color. That means that we'll get a smooth gradient
+which is exactly what we need for the gouraud shading. OpenGL does all
+the hard work for us!
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics{images/opengl-shaded-triangle}
+  \caption{OpenGL shaded RGB triangle}
+  \label{fig:opengl_shaded_triangle}
+\end{figure}
+
+Figure~\ref{fig:opengl_shaded_triangle} shows an example of a triangle
+rendered with our fragment shader: each of the three vertex is colored
+using one of the
+\href{https://en.wikipedia.org/wiki/RGB_color_model}{RGB} colors and
+we can see that the GPU interpolates the gradient for each of the
+pixels inside the triangle.
+
+\subsection{Compiling and linking the shaders}
+
+We can now piece our shaders together in our \code{Renderer}:
+
+\begin{lstlisting}
+pub struct Renderer {
+    //...
+
+    /// Vertex shader object
+    vertex_shader: GLuint,
+    /// Fragment shader object
+    fragment_shader: GLuint,
+    /// OpenGL Program object
+    program: GLuint,
+    /// OpenGL Vertex array object
+    vertex_array_object: GLuint,
+    /// Buffer containing the vertice positions
+    positions: Buffer<Position>,
+    /// Buffer containing the vertice colors
+    colors: Buffer<Color>,
+    /// Current number or vertices in the buffers
+    nvertices: u32,
+}
+
+
+impl Renderer {
+
+    pub fn new() -> Renderer {
+        //...
+
+        // "Slurp" the contents of the shader files. Note: this is
+        // a compile-time thing.
+        let vs_src = include_str!("vertex.glsl");
+        let fs_src = include_str!("fragment.glsl");
+
+        // Compile our shaders...
+        let vertex_shader   = compile_shader(vs_src,
+                                             gl::VERTEX_SHADER);
+        let fragment_shader = compile_shader(fs_src,
+                                             gl::FRAGMENT_SHADER);
+        // ... Link our program...
+        let program = link_program(&[vertex_shader,
+                                     fragment_shader]);
+        // ... And use it.
+        unsafe {
+            gl::UseProgram(program);
+        }
+
+        // Generate our vertex attribute object that will hold our
+        // vertex attributes
+        let mut vao = 0;
+        unsafe {
+            gl::GenVertexArrays(1, &mut vao);
+            // Bind our VAO
+            gl::BindVertexArray(vao);
+        }
+
+        // Setup the "position" attribute. First we create
+        // the buffer holding the positions (this call also
+        // binds it)
+        let positions = Buffer::new();
+
+        unsafe {
+            // Then we retreive the index for the attribute in the
+            // shader
+            let index = find_program_attrib(program,
+                                            "vertex_position");
+
+            // Enable it
+            gl::EnableVertexAttribArray(index);
+
+            // Link the buffer and the index: 2 GLshort attributes,
+            // not normalized. That should send the data untouched
+            // to the vertex shader.
+            gl::VertexAttribIPointer(index, 2, gl::SHORT, 0, ptr::null());
+        }
+
+        // Setup the "color" attribute and bind it
+        let colors = Buffer::new();
+
+        unsafe {
+            let index = find_program_attrib(program,
+                                            "vertex_color");
+            gl::EnableVertexAttribArray(index);
+
+            // Link the buffer and the index: 3 GLByte attributes,
+            // not normalized. That should send the data untouched
+            // to the vertex shader.
+            gl::VertexAttribIPointer(index,
+                                     3,
+                                     gl::UNSIGNED_BYTE,
+                                     0,
+                                     ptr::null());
+        }
+
+        Renderer {
+            sdl_context: sdl_context,
+            window: window,
+            gl_context: gl_context,
+            vertex_shader: vertex_shader,
+            fragment_shader: fragment_shader,
+            program: program,
+            vertex_array_object: vao,
+            positions: positions,
+            colors: colors,
+            nvertices: 0,
+        }
+    }
+    //...
+}
+\end{lstlisting}
+
+Quite a lot of code to go through here. I put the code for our two
+shaders described earlier in two files named ``vertex.glsl'' and
+``fragment.glsl'' respectively. I retreive their contents here using
+Rust's \code{include\_str} directive. Then I ask OpenGL to compile
+both shaders using the \code{compile\_shader} helper function:
+
+\begin{lstlisting}
+pub fn compile_shader(src: &str, shader_type: GLenum) -> GLuint {
+    let shader;
+
+    unsafe {
+        shader = gl::CreateShader(shader_type);
+        // Attempt to compile the shader
+        let c_str = CString::new(src.as_bytes()).unwrap();
+        gl::ShaderSource(shader, 1, &c_str.as_ptr(), ptr::null());
+        gl::CompileShader(shader);
+
+        // Extra bit of error checking in case we're not using a
+        // DEBUG OpenGL context and check_for_errors can't do it
+        // properly:
+        let mut status = gl::FALSE as GLint;
+        gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut status);
+
+        if status != (gl::TRUE as GLint) {
+            panic!("Shader compilation failed!");
+        }
+    }
+
+    shader
+}
+\end{lstlisting}
+
+The compilation is always done at runtime when we start the emulator.
+
+Once the shaders are compiled we must link them together to form a
+complete OpenGL ``program''. This is done by the \code{link\_program}
+helper function:
+
+\begin{lstlisting}
+pub fn link_program(shaders: &[GLuint]) -> GLuint {
+    let program;
+
+    unsafe {
+        program = gl::CreateProgram();
+
+        for &shader in shaders {
+            gl::AttachShader(program, shader);
+        }
+
+        gl::LinkProgram(program);
+
+        // Extra bit of error checking in case we're not using a
+        // DEBUG OpenGL context and check_for_errors can't do it
+        // properly:
+        let mut status = gl::FALSE as GLint;
+        gl::GetProgramiv(program, gl::LINK_STATUS, &mut status);
+
+        if status != (gl::TRUE as GLint) {
+            panic!("OpenGL program linking failed!");
+        }
+    }
+
+    program
+}
+\end{lstlisting}
+
+Once the program is linked \code{UseProgram} activates it. We can then
+setup our position and color attributes.
+
+\subsection{Vertex array objects}
+
+First we need to create a ``vertex array object'' (VAOs) to old the
+attributes. The idea is that if you have different sets of attributes
+in your application and you want to be able to switch rapidly you
+create one vertex array object per set and you can then switch between
+them with a single call (instead of one call per attribute).
+
+We don't really need more than one set at that point so we just create
+a single one with \code{GenVertexArrays} and bind it with
+\code{BindVertexArray}.
+
+At last we use our \code{Buffer} struct to initialize the
+\code{positions} buffer. We then need to associate it with the
+\code{vertex\_position} attribute in the vertex shader. In order to do
+this we use the \code{find\_program\_attrib} function to recover the
+attribute index is the `program`:
+
+\begin{lstlisting}
+/// Return the index of attribute `attr` in `program`. Panics if
+/// the index isn't found.
+pub fn find_program_attrib(program: GLuint, attr: &str) -> GLuint {
+    let cstr = CString::new(attr).unwrap().as_ptr();
+
+    let index = unsafe { gl::GetAttribLocation(program, cstr) };
+
+    if index < 0 {
+        panic!("Attribute \"{}\" not found in program", attr);
+    }
+
+    index as GLuint
+}
+\end{lstlisting}
+
+We must then enable the attribute with \code{EnableVertexAttribArray}
+and we describe the format of the buffer with
+\code{VertexAttribIPointer}. This last call is very important to get
+right, otherwise the program's behavior will be potentially undefined:
+
+\begin{itemize}
+\item The first parameter is the \code{index} of the attribute in the
+  program.
+
+\item The second parameter contains the number of elements \emph{per
+  vertex} in the buffer. For the position we have the x and y
+  coordinates, so that's two. It matches our declaration in the vertex
+  shader since we used an \code{ivec2} to hold this value.
+
+\item The third parameter is the type of each element. It must match
+  the type we're using to represent the values in our rust code. In
+  this case we're using \code{GLshort}s to hold the coordinates so we
+  set it to \code{SHORT}.
+
+\item The fourth parameter is the ``stride'' which is a number of
+  bytes the GPU will skip between each value. Since we don't have any
+  padding in our buffer we set it to 0.
+
+\item The last parameter is an optional pointer to some data that will
+  be copied as the initial value of the attribute buffer. We don't
+  have any data to put in at that point (and we could do it through
+  our \code{Buffer} mapping if we wanted anyway) so we set it to
+  NULL.
+\end{itemize}
+
+After this call our position buffer will be ready for use!
+
+We then go through the same sequence for our color buffer, the only
+difference being the parameters to the \code{VertexAttribIPointer}
+call: this time we have three values per vertex and the type is
+\code{UNSIGNED\_BYTE}.
+
+Finally I put it all in the \code{Renderer} struct along with an
+\code{nvertices} variable that will hold the current number of
+vertices ready to be drawn in the vertex buffers.
+
+In order to clean everything up properly when we exit we need a
+destructor to release the resources:
+
+\begin{lstlisting}
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteVertexArrays(1, &self.vertex_array_object);
+            gl::DeleteShader(self.vertex_shader);
+            gl::DeleteShader(self.fragment_shader);
+            gl::DeleteProgram(self.program);
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{OpenGL rendering and synchronization}
+
+Now we have everything to finally implement our \code{push\_triangle}
+command. It will just push the three positions and colors into their
+respective buffers. However we need to be careful not to overflow so
+if the buffers are full we must force an early draw:
+
+\begin{lstlisting}
+impl Renderer {
+    //...
+
+    /// Add a triangle to the draw buffer
+    pub fn push_triangle(&mut self,
+                         positions: [Position; 3],
+                         colors:    [Color; 3]) {
+
+        // Make sure we have enough room left to queue the vertex
+        if self.nvertices + 3 > VERTEX_BUFFER_LEN {
+            println!("Vertex attribute buffers full, forcing draw");
+            self.draw();
+        }
+
+        for i in 0..3 {
+            // Push
+            self.positions.set(self.nvertices, positions[i]);
+            self.colors.set(self.nvertices, colors[i]);
+            self.nvertices += 1;
+        }
+    }
+}
+\end{lstlisting}
+
+The draw command itself is not very complicated but we need to be
+careful to synchronize ourselves properly with the GPU. That means
+flushing our buffers before we ask the GPU to start drawing and then
+waiting for the rendering to finish before we touch the buffers again:
+
+\begin{lstlisting}
+impl Renderer {
+    //...
+
+    /// Draw the buffered commands and reset the buffers
+    pub fn draw(&mut self) {
+        unsafe {
+           // Make sure all the data from the persistent mappings
+           // is flushed to the buffer
+           gl::MemoryBarrier(gl::CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+
+           gl::DrawArrays(gl::TRIANGLES,
+                          0,
+                          self.nvertices as GLsizei);
+        }
+
+        // Wait for GPU to complete
+        unsafe {
+           let sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE,
+                                     0);
+
+           loop {
+               let r = gl::ClientWaitSync(
+                                 sync,
+                                 gl::SYNC_FLUSH_COMMANDS_BIT,
+                                 10000000);
+
+               if r == gl::ALREADY_SIGNALED ||
+                  r == gl::CONDITION_SATISFIED {
+                   // Drawing done
+                   break;
+               }
+           }
+        }
+
+        // Reset the buffers
+        self.nvertices = 0;
+    }
+}
+\end{lstlisting}
+
+The call to \code{MemoryBarrier} makes sure the data written to the
+mapped buffer is visible by the GPU instead of, say, stuck in a CPU
+cache. We could avoid this call by mapping the buffer with the
+\code{MAP\_COHERENT\_BIT} access flag set but that might make writing
+to the buffers slower so it's not necessarily better.
+
+The \code{DrawArrays} function is where the magic happens: it tells
+the GPU to draw \code{nvertices} as triangles. Once this command is
+issued the GPU will start working asynchronously so we must be
+careful: if we start pushing new data to the buffers before the GPU is
+done we might overwrite attributes that are still in use which may
+cause glitches.
+
+To avoid that we simply wait for the GPU to finish by using a fence:
+\code{FencSync} creates a fence waiting for the current commands to
+complete and \code{ClientWaitSync} is used to wait for completion.
+
+Finally we reset nvertices to 0 to start anew.
+
+This method is actually pretty suboptimal: we stall our emulator
+completely when the GPU is working. We could improve this by using
+double buffering on for our attributes but let's leave that for later.
+
+This \code{draw} command will render everything but it won't display
+anything until we swap the window's buffer. We can add a
+\code{display} command to do just that:
+
+\begin{lstlisting}
+impl Render {
+    //...
+
+    /// Draw the buffered commands and display them
+    pub fn display(&mut self) {
+        self.draw();
+
+        self.window.gl_swap_window();
+    }
+}
+\end{lstlisting}
+
+Now we need to figure out when to call this method. Normally we'd want
+to call it at each VSYNC, so 60 or 50 times per second depending on
+the video mode but we don't support GPU timings yet. Instead for the
+time being we can find a command that the BIOS calls once per frame
+and put the \code{display} call in there. Once such command seems to
+be ``Set Drawing Offset'' so let's put our call to \code{display} in
+there:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0xE5): Set Drawing Offset
+    fn gp0_drawing_offset(&mut self) {
+        //...
+
+        // XXX Temporary hack: force display when changing offset
+        // since we don't have proper timings
+        self.renderer.display();
+    }
+}
+\end{lstlisting}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=\textwidth]{images/first-triangles}
+  \caption{First output of our OpenGL renderer}
+  \label{fig:renderer_first_triangles}
+\end{figure}
+
+
+We should now finally be ready to draw ou first triangles. If you
+restart the emulator you should end up with the image in
+figure~\ref{fig:renderer_first_triangles}.
+
+The two triangles start back-to-back and then move and shrink to their
+final position. Since we don't yet draw the background quad they're
+all drawn on top of each other which gives this color smearing
+effect. Note that the image has a weird aspect ratio (2:1) and that
+the logo is not centered, it's because we're displaying the entire
+VRAM framebuffer instead of just the 640x480 portion configured in the
+video output.
+
 \newpage
 
 \listoftables
+\listoffigures
 
 \end{document}
