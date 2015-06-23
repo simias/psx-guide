@@ -53,7 +53,7 @@
 
 \lstdefinelanguage{glsl}%
   {
-   morekeywords={void,main,in,out,float,%
+   morekeywords={void,main,in,out,float,core,%
                  vec2,vec3,vec4,%
                  ivec2,ivec3,ivec4,%
                  uvec2,uvec3,uvec4,%
@@ -9377,8 +9377,8 @@ void main() {
 
   // Convert the components from [0;255] to [0;1]
   color = vec3(float(vertex_color.r) / 255,
-	       float(vertex_color.g) / 255,
-	       float(vertex_color.b) / 255);
+               float(vertex_color.g) / 255,
+               float(vertex_color.b) / 255);
 }
 \end{lstlisting}
 
@@ -9904,7 +9904,6 @@ impl Gpu {
   \label{fig:renderer_first_triangles}
 \end{figure}
 
-
 We should now finally be ready to draw ou first triangles. If you
 restart the emulator you should end up with the image in
 figure~\ref{fig:renderer_first_triangles}.
@@ -9916,6 +9915,442 @@ effect. Note that the image has a weird aspect ratio (2:1) and that
 the logo is not centered, it's because we're displaying the entire
 VRAM framebuffer instead of just the 640x480 portion configured in the
 video output.
+
+\subsection{OpenGL debugging}
+
+You might have noticed that there's not a whole lot of error checking
+in my OpenGL code above. We could call `GetError` after every OpenGL
+function but that's annoying an noisy. Instead I prefer to use the
+\href{https://www.khronos.org/registry/gles/extensions/KHR/debug.txt}{debug
+  extension}.
+
+This extension logs errors, warnings, performance notices and other
+messages to an internal queue. We can then call
+\code{GetDebugMessageLog} to retreive the messages\footnote{I'm
+  leaving out the definition of the various \code{Debug*} types which
+  are just thin wrappers around the OpenGL values, as always check the
+  repository if you want to see the entire code.}:
+
+\begin{lstlisting}
+/// Check for OpenGL errors using `gl::GetDebugMessageLog`. If a
+/// severe error is encountered this function panics. If the OpenGL
+/// context doesn't have the DEBUG attribute this *probably* won't do
+/// anything.
+pub fn check_for_errors() {
+    let mut fatal = false;
+
+    loop {
+        let mut buffer = vec![0; 4096];
+
+        let mut severity = 0;
+        let mut source = 0;
+        let mut message_size= 0;
+        let mut mtype = 0;
+        let mut id = 0;
+
+        let count =
+            unsafe {
+                gl::GetDebugMessageLog(1,
+                                       buffer.len() as GLsizei,
+                                       &mut source,
+                                       &mut mtype,
+                                       &mut id,
+                                       &mut severity,
+                                       &mut message_size,
+                                       buffer.as_mut_ptr() as *mut GLchar)
+            };
+
+        if count == 0 {
+            // No messages left
+            break;
+        }
+
+        buffer.truncate(message_size as usize);
+
+        let message =
+            match str::from_utf8(&buffer) {
+                Ok(m) => m,
+                Err(e) => panic!("Got invalid message: {}", e),
+            };
+
+        let source = DebugSource::from_raw(source);
+        let severity = DebugSeverity::from_raw(severity);
+        let mtype = DebugType::from_raw(mtype);
+
+        println!("OpenGL [{:?}|{:?}|{:?}|0x{:x}] {}",
+                 severity, source, mtype, id, message);
+
+        if severity.is_fatal() {
+            // Something is very wrong, don't die just yet in order to
+            // display any additional error message
+            fatal = true;
+        }
+    }
+
+    if fatal {
+        panic!("Fatal OpenGL error");
+    }
+}
+\end{lstlisting}
+
+We can then call the \code{check\_for\_errors} method after critical
+sections: in `draw` for instance to check for errors in the past frame
+but also at the end of `new` to make sure the initialization went
+well. There's one caveat though: the debug extension only works when
+we use a debug OpenGL context. We can get one by setting the
+\code{CONTEXT\_DEBUG} attribute before we create the window:
+
+\begin{lstlisting}
+sdl2::video::gl_set_attribute(
+                    GLAttr::GLContextFlags,
+                    sdl2::video::GL_CONTEXT_DEBUG.bits());
+\end{lstlisting}
+
+A debug context might be slower than a normal one though so we'll
+probably want to only activate this for troubleshooting (via a command
+line flag or something like that). For now performances don't matter
+in the least so we can leave it enabled at all times.
+
+The error messages themselves are vendor specific but hopefully they
+should be helpful. For instance with my radeon card if I mess up my
+vertex shader by replacing \code{vec3} by \code{vec4} in the color
+affectation I get the following message:
+
+\begin{verbatim}
+OpenGL [High|ShaderCompiler|Error|0x1] 0:19(10):
+error: too few components to vec4
+\end{verbatim}
+
+\subsection{Drawing quadrilaterals}
+
+Modern OpenGL doesn't support quads, only points, lines and
+triangles\footnote{Although you can emulate proper quad shading in
+  shaders if you really need to.}. Fortunately for us, neither does
+the Playstation GPU! When a quad draw command is received it's
+interpreted as two triangles and drawn that way. This is significant
+for gouraud shaded quadrilaterals since it means that only three
+vertices are ever used to interpolate the color of any pixel in the
+quad. For textured quads it shouldn't make any difference.
+
+We can emulate that behavior in a \code{push\_quad} method:
+
+\begin{lstlisting}
+Impl Renderer {
+    //...
+
+    /// Add a quad to the draw buffer
+    pub fn push_quad(&mut self,
+                     positions: [Position; 4],
+                     colors:    [Color; 4]) {
+
+        // Make sure we have enough room left to queue the vertex. We
+        // need to push two triangles to draw a quad, so 6 vertex
+        if self.nvertices + 6 > VERTEX_BUFFER_LEN {
+            // The vertex attribute buffers are full, force an early
+            // draw
+            self.draw();
+        }
+
+        // Push the first triangle
+        for i in 0..3 {
+            self.positions.set(self.nvertices, positions[i]);
+            self.colors.set(self.nvertices, colors[i]);
+            self.nvertices += 1;
+        }
+
+        // Push the 2nd triangle
+        for i in 1..4 {
+            self.positions.set(self.nvertices, positions[i]);
+            self.colors.set(self.nvertices, colors[i]);
+            self.nvertices += 1;
+        }
+    }
+}
+\end{lstlisting}
+
+We must duplicate the two vertices shared by the two triangles across
+one of the quad's diagonal so we end up with 6 vertices for a single
+quad. It's possible to avoid that duplication (for instance by using
+indexed rendering) but at that point it would be premature
+optimization.
+
+Now all that's left to do is to is use \code{push\_quad} to draw the
+monochrome and shaded quadrilaterals:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0x28): Monochrome Opaque Quadrilateral
+    fn gp0_quad_mono_opaque(&mut self) {
+        let positions = [
+            Position::from_gp0(self.gp0_command[1]),
+            Position::from_gp0(self.gp0_command[2]),
+            Position::from_gp0(self.gp0_command[3]),
+            Position::from_gp0(self.gp0_command[4]),
+            ];
+
+        // Only one color repeated 4 times
+        let colors = [ Color::from_gp0(self.gp0_command[0]); 4];
+
+        self.renderer.push_quad(positions, colors);
+    }
+
+   /// GP0(0x38): Shaded Opaque Quadrilateral
+    fn gp0_quad_shaded_opaque(&mut self) {
+        let positions = [
+            Position::from_gp0(self.gp0_command[1]),
+            Position::from_gp0(self.gp0_command[3]),
+            Position::from_gp0(self.gp0_command[5]),
+            Position::from_gp0(self.gp0_command[7]),
+            ];
+
+        let colors = [
+            Color::from_gp0(self.gp0_command[0]),
+            Color::from_gp0(self.gp0_command[2]),
+            Color::from_gp0(self.gp0_command[4]),
+            Color::from_gp0(self.gp0_command[6]),
+            ];
+
+        self.renderer.push_quad(positions, colors);
+    }
+}
+\end{lstlisting}
+
+Even though we use per-vertex colors it's easy to draw monochrome
+primitives by repeating the same color. We have encountered a third
+quad command, \code{gp0\_quad\_texture\_blend\_opaque} but since we
+don't support textures we can't implement that correctly yet. In the
+meantime we can use a solid color instead, it won't look right but at
+least we'll see \emph{something}:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    /// GP0(0x2C): Textured Opaque Quadrilateral
+    fn gp0_quad_texture_blend_opaque(&mut self) {
+        let positions = [
+            Position::from_gp0(self.gp0_command[1]),
+            Position::from_gp0(self.gp0_command[3]),
+            Position::from_gp0(self.gp0_command[5]),
+            Position::from_gp0(self.gp0_command[7]),
+            ];
+
+        // XXX We don't support textures for now, use a solid red
+        // color instead
+        let colors = [ Color(0x80, 0x00, 0x00); 4];
+
+        self.renderer.push_quad(positions, colors);
+    }
+}
+\end{lstlisting}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=\textwidth]{images/logo-notextures}
+  \caption{Playstation boot logo without textures}
+  \label{fig:bootlogo_notextures}
+\end{figure}
+
+Lo and behold, we should now have something that looks very much like the
+``Sony Computer Entertainment'' boot logo, minus the text which is
+contained in the textures. Figure~\ref{fig:bootlogo_notextures} shows
+the expected output.
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=\textwidth]{images/logo-badquad}
+  \caption{Playstation boot logo with bad quad rendering}
+  \label{fig:bootlogo_badquad}
+\end{figure}
+
+As before the black area at the right and bottom of the image is due
+to the fact that we display the entire framebuffer instead of just the
+part configured in the video output. You can see that a single 640x480
+image already takes more than half of the entire VRAM and we're only
+displaying a very simple logo. Game developers back then had to be
+very careful with VRAM usage (and memory usage in general). This is
+also one of the reasons most games are rendered at lower resolutions
+like 640x240, but we'll see that later.
+
+Note that there are two ways to split a quadrilateral in two triangles
+by cutting along either diagonal. The choice is significant,
+figure~\ref{fig:bootlogo_badquad} shows the result of splitting across
+the other diagonal\footnote{I modified \code{push\_quad}: instead of
+  rendering triangles with vertex indexes [0,~1,~2] and [1,~2,~3] I
+  used [2,~3,~0] and [3,~0,~1].}. You can see that the main ``tilted
+square'' behind the two triangles is shaded differently. If your
+emulator's output looks like this it means that you're not rendering
+the quads in the right order, you need to split along the other
+diagonal.
+
+\subsection{Draw Offset emulation}
+
+Our OpenGL renderer is very basic but we can at least add the draw
+offset easily. Of course the most obvious way would be to add it to
+the \code{Position}s before we put them in the attribute buffer but
+instead we can have the vertex shader do it for us!
+
+In order to do this we can declare an ``uniform'' in the shader code:
+
+\begin{lstlisting}[language=glsl]
+//...
+
+// Drawing offset
+uniform ivec2 offset;
+
+void main() {
+  ivec2 position = vertex_position + offset;
+
+  // Convert VRAM coordinates (0;1023, 0;511) into
+  // OpenGL coordinates (-1;1, -1;1)
+  float xpos = (float(position.x) / 512) - 1.0;
+  // VRAM puts 0 at the top, OpenGL at the bottom,
+  // we must mirror vertically
+  float ypos = 1.0 - (float(position.y) / 256);
+
+  gl_Position.xyzw = vec4(xpos, ypos, 0.0, 1.0);
+
+  //...
+}
+\end{lstlisting}
+
+Uniforms are inputs that are shared across all the intances of the
+shader. So instead of having an \code{offset} vertex attribute with
+one entry per vertex we can have a single variable that will be used
+for an entire batch of primitives.
+
+To be able to modify the value of the uniform from our code we must
+retreive the index like we did for the vertex attributes. We can then
+set its value using \code{Uniform2i}\footnote{The \code{2i} part means
+  that the function works on \code{ivec2}s, there are other
+  \code{Uniform*} functions for the various other types.}:
+
+\begin{lstlisting}
+impl Renderer {
+    //...
+
+    /// Index of the "offset" shader uniform
+    uniform_offset: GLint,
+}
+
+impl Renderer {
+
+    pub fn new() -> Renderer {
+        //...
+
+        // Retreive and initialize the draw offset
+        let uniform_offset = find_program_uniform(program,
+                                                 "offset");
+        unsafe {
+            gl::Uniform2i(uniform_offset, 0, 0);
+        }
+
+        Renderer {
+            //...
+
+            uniform_offset: uniform_offset,
+        }
+    }
+
+    //...
+}
+\end{lstlisting}
+
+We can now add a method to set the value of the uniform. We need to be
+careful to draw the currently buffered primitives before we change the
+offset since those were supposed to be drawn with the previous value
+and might end up located at the wrong place:
+
+\begin{lstlisting}
+impl Renderer {
+    //...
+
+    /// Set the value of the uniform draw offset
+    pub fn set_draw_offset(&mut self, x: i16, y: i16) {
+        // Force draw for the primitives with the current offset
+        self.draw();
+
+        // Update the uniform value
+        unsafe {
+            gl::Uniform2i(self.uniform_offset,
+                          x as GLint,
+                          y as GLint);
+        }
+    }
+}
+\end{lstlisting}
+
+Finally we can get rid of our \code{drawing\_x\_offset} and
+\code{drawing\_y\_offset} member variables in the GPU and call
+\code{set\_draw\_offset} directly instead.
+
+The fact that we have to force a partial draw every time the offset is
+changed means that in pathological cases this might end up being
+slower. For instance if a game draws thounsands of triangles, changing
+the offset between each one, we'll issue thousands of partial draw
+commands. In this case it would probably be faster to simply add the
+offset before we push the \code{Position}s in the attribute buffer.
+
+\subsection{Handling SDL2 events and exiting cleanly}
+
+Before we move on I want to fix one annoying problem introduced by our
+brand new SDL2 window: since we don't handle SDL events we can't exit
+the emulator cleanly. And since SDL2 catches SIGINT by default we
+can't even interrupt our emulator with \verb|^C| anymore.
+
+Fortunately it's an easy fix: instead of initializing the SDL context
+in the \code{Renderer} we move it all the way up in the \code{main}
+function and then check for events in the top level loop. Since we
+need the SDL context to create the window we also have to shuffle
+constructors a bit: I've decided to create the renderer in the main
+function then move it into the \code{Gpu} constructor which is itself
+moved into the \code{Interconnect} constructor:
+
+\begin{lstlisting}
+use sdl2::event::Event;
+use sdl2::keycode::KeyCode;
+
+fn main() {
+    let bios = Bios::new(&Path::new("roms/SCPH1001.BIN")).unwrap();
+
+    // We must initialize SDL before the interconnect is created since
+    // it contains the GPU and the GPU needs to create a window
+    let sdl_context = sdl2::init(::sdl2::INIT_VIDEO).unwrap();
+
+    let renderer = Renderer::new(&sdl_context);
+    let gpu = Gpu::new(renderer);
+    let inter = Interconnect::new(bios, gpu);
+    let mut cpu = Cpu::new(inter);
+
+    let mut event_pump = sdl_context.event_pump();
+
+    loop {
+        for _ in 0..1_000_000 {
+            cpu.run_next_instruction();
+        }
+
+        // See if we should quit
+        for e in event_pump.poll_iter() {
+            match e {
+                Event::KeyDown { keycode: KeyCode::Escape, .. } => return,
+                Event::Quit {..} => return,
+                _ => (),
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+When the \code{Quit} event is encountered (window closes, received
+SIGINT etc...) we return from main, effectively exiting the
+program. For convenience I also quit when the \code{Escape} key is
+pressed in the window.
+
+The inner \code{for} loop is needed because checking for events before
+every instruction slows everything down very significantly so I only
+check once for every million instruction executed.
 
 \newpage
 
