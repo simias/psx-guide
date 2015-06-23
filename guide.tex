@@ -10352,6 +10352,93 @@ The inner \code{for} loop is needed because checking for events before
 every instruction slows everything down very significantly so I only
 check once for every million instruction executed.
 
+\section{The interconnect: Generic loads and stores}
+
+At this point we have three load and three store methods in our
+interconnect to deal with byte, halfword and word accesses. Those
+implementations look very similar to each other.
+
+When we implement the debugger and the timings you'll see that we'll
+need special versions of those methods. At this rate we'll end up with
+dozens of memory access functions that will be very similar but for a
+few key differences.
+
+This is a lot of potential code duplication. Fortunately we can avoid
+most of it by making our code use generics instead of having different
+flavors for 8, 16 and 32bit loads and store.
+
+The first step is to create a generic \code{Addressable} trait:
+
+\begin{lstlisting}
+/// Types of access supported by the Playstation architecture
+#[derive(PartialEq,Eq,Debug)]
+pub enum AccessWidth {
+    Byte = 1,
+    Halfword = 2,
+    Word = 4,
+}
+
+/// Trait representing the attributes of a primitive addressable
+/// memory location.
+pub trait Addressable {
+    /// Retreive the width of the access
+    fn width() -> AccessWidth;
+    /// Build an Addressable value from an u32. If the Addressable is 8
+    /// or 16bits wide the MSBs are discarded to fit.
+    fn from_u32(u32) -> Self;
+    /// Retreive the value of the Addressable as an u32. If the
+    /// Addressable is 8 or 16bits wide the MSBs are padded with 0s.
+    fn as_u32(self) -> u32;
+}
+\end{lstlisting}
+
+We can then implement this trait for \code{u8}, \code{u16} and
+\code{u32}:
+
+\begin{lstlisting}
+impl Addressable for u8 {
+    fn width() -> AccessWidth {
+        AccessWidth::Byte
+    }
+
+    fn from_u32(v: u32) -> u8 {
+        v as u8
+    }
+
+    fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+impl Addressable for u16 {
+    fn width() -> AccessWidth {
+        AccessWidth::Halfword
+    }
+
+    fn from_u32(v: u32) -> u16 {
+        v as u16
+    }
+
+    fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+impl Addressable for u32 {
+    fn width() -> AccessWidth {
+        AccessWidth::Word
+    }
+
+    fn from_u32(v: u32) -> u32 {
+        v
+    }
+
+    fn as_u32(self) -> u32 {
+        self
+    }
+}
+\end{lstlisting}
+
 \newpage
 
 \listoftables
