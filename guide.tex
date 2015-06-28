@@ -5271,9 +5271,9 @@ come.
 Well, let's not get ahead of ourselves, for now we have zero GPU
 emulation code so we're going to use the usual deception and have the
 BIOS read zeroes when it attempts to access the GPU register
-space. That's easy, there are only two registers in the GPU (well,
-four really: two read only and two write only sharing the same
-addresses):
+space. That's easy, there are only two registers in the
+GPU\footnote{Well, four really: two read only and two write only
+  sharing the same addresses.}:
 
 \begin{lstlisting}
 impl Interconnect {
@@ -10352,7 +10352,7 @@ The inner \code{for} loop is needed because checking for events before
 every instruction slows everything down very significantly so I only
 check once for every million instruction executed.
 
-\section{The interconnect: Generic loads and stores}
+\section{The Interconnect: Generic loads and stores}
 
 At this point we have three load and three store methods in our
 interconnect to deal with byte, halfword and word accesses. Those
@@ -10438,6 +10438,331 @@ impl Addressable for u32 {
     }
 }
 \end{lstlisting}
+
+\subsection{Porting the CPU code}
+
+We can now factor our various memory access functions by making them
+generic over this \code{Addressable} trait. On the CPU it looks like
+this:
+
+\begin{lstlisting}
+impl Cpu {
+    //...    
+
+    /// Memory read
+    fn load<T: Addressable>(&self, addr: u32) -> T {
+        self.inter.load(addr)
+    }
+    
+    /// Memory write
+    fn store<T: Addressable>(&mut self, addr: u32, val: T) {
+        if self.sr & 0x10000 != 0 {
+            // Cache is isolated, ignore write
+            println!("Ignoring store while cache is isolated");
+            return;
+        }
+
+        self.inter.store(addr, val);
+    }
+}
+\end{lstlisting}
+
+We can then replace the various \code{load*} and \code{store*}
+functions used in the CPU code by the generic versions. Most of the
+time the compiler can't infer the type properly (since we're casting
+all over the place to get the correct width and sign extension) so we
+have to explicitly tell it which of \code{u8}, \code{u16} or
+\code{u32} to use. For instance our LB implementation becomes:
+
+\begin{lstlisting}
+impl Cpu {
+    //...    
+
+    /// Load Byte (signed)
+    fn op_lb(&mut self,
+             instruction: Instruction,
+             debugger: &mut Debugger) {
+
+        let i = instruction.imm_se();
+        let t = instruction.t();
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        // Cast as i8 to force sign extension
+        let v = self.load::<u8>(addr, debugger) as i8;
+
+        // Put the load in the delay slot
+        self.load = (t, v as u32);
+    }
+}
+\end{lstlisting}
+
+\subsection{Porting the interconnect code}
+
+Then we need to port our interconnect code to use the generic
+interface. We have to merge the various load and store function in a
+single generic one. First the load function:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Interconnect: load value at `addr`
+    pub fn load<T: Addressable>(&self, addr: u32) -> T {
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::RAM.contains(abs_addr) {
+            return self.ram.load(offset);
+        }
+
+        if let Some(offset) = map::BIOS.contains(abs_addr) {
+            return self.bios.load(offset);
+        }
+
+        if let Some(offset) = map::IRQ_CONTROL.contains(abs_addr) {
+            println!("IRQ control read {:x}", offset);
+            return Addressable::from_u32(0);
+        }
+
+        if let Some(offset) = map::DMA.contains(abs_addr) {
+            return self.dma_reg(offset);
+        }
+
+        if let Some(offset) = map::GPU.contains(abs_addr) {
+            return self.gpu.load(offset);
+        }
+
+        if let Some(offset) = map::TIMERS.contains(abs_addr) {
+            println!("Unhandled read from timer register {:x}",
+                     offset);
+            return Addressable::from_u32(0);
+        }
+
+        if let Some(_) = map::SPU.contains(abs_addr) {
+            println!("Unhandled read from SPU register {:08x}",
+                     abs_addr);
+            return Addressable::from_u32(0);
+        }
+
+        if let Some(_) = map::EXPANSION_1.contains(abs_addr) {
+            // No expansion implemented. Returns full ones when no
+            // expansion is present
+            return Addressable::from_u32(!0);
+        }
+
+        panic!("unhandled load at address {:08x}", addr);
+    }
+}
+\end{lstlisting}
+
+You can see that the \code{Addressable::from\_u32} function can be
+used to return a literal value without having to know the real type
+being used.
+
+The store function is pretty straightforward:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// Interconnect: store `val` into `addr`
+    pub fn store<T: Addressable>(&mut self, addr: u32, val: T) {
+
+        let abs_addr = map::mask_region(addr);
+
+        if let Some(offset) = map::RAM.contains(abs_addr) {
+            return self.ram.store(offset, val);
+        }
+
+        if let Some(offset) = map::IRQ_CONTROL.contains(abs_addr) {
+            println!("IRQ control: {:x} <- {:08x}", offset,
+                     val.as_u32());
+            return;
+        }
+
+        if let Some(offset) = map::DMA.contains(abs_addr) {
+            return self.set_dma_reg(offset, val);
+        }
+
+        if let Some(offset) = map::GPU.contains(abs_addr) {
+            return self.gpu.store(offset, val);
+        }
+
+        if let Some(offset) = map::TIMERS.contains(abs_addr) {
+            println!("Unhandled write to timer register");
+            return;
+        }
+
+        if let Some(_) = map::SPU.contains(abs_addr) {
+            println!("Unhandled write to SPU register");
+            return;
+        }
+
+        if let Some(_) = map::CACHE_CONTROL.contains(abs_addr) {
+            println!("Unhandled write to CACHE_CONTROL");
+            return;
+        }
+
+        if let Some(offset) = map::MEM_CONTROL.contains(abs_addr) {
+            match offset {
+                0 => // Expansion 1 base address
+                    if val != 0x1f000000 {
+                        panic!("Bad expansion 1 base address");
+                    },
+                4 => // Expansion 2 base address
+                    if val != 0x1f802000 {
+                        panic!("Bad expansion 2 base address");
+                    },
+                _ =>
+              println!("Unhandled write to MEM_CONTROL register"),
+            }
+
+            return;
+        }
+
+        if let Some(_) = map::RAM_SIZE.contains(abs_addr) {
+            // We ignore writes at this address
+            return;
+        }
+
+        if let Some(offset) = map::EXPANSION_2.contains(abs_addr) {
+            println!("Unhandled write to expansion 2 register");
+            return;
+        }
+
+        panic!("unhandled store32 into address {:08x}: {:08x}",
+               addr, val.as_u32());
+    }
+}
+\end{lstlisting}
+
+\subsection{Porting the RAM and BIOS}
+
+For the RAM we need to know how many bytes must be loaded or
+stored. We can use the \code{Addressable::width} method to figure it
+out:
+
+\begin{lstlisting}
+impl Ram {
+    //...
+
+    /// Fetch the little endian value at `offset`
+    pub fn load<T: Addressable>(&self, offset: u32) -> T {
+        let offset = offset as usize;
+
+        let mut v = 0;
+
+        for i in 0..T::width() as usize {
+            v |= (self.data[offset + i] as u32) << (i * 8)
+        }
+
+        Addressable::from_u32(v)
+    }
+
+    /// Store the 32bit little endian word `val` into `offset`
+    pub fn store<T: Addressable>(&mut self, offset: u32, val: T) {
+        let offset = offset as usize;
+
+        let val = val.as_u32();
+
+        for i in 0..T::width() as usize {
+            self.data[offset + i] = (val >> (i * 8)) as u8;
+        }
+    }
+}
+\end{lstlisting}
+
+The BIOS doesn't have a \code{store} method since it's read-only and
+we can reuse the RAM's \code{load} code without any change.
+
+This looping and bit fiddling might seem a little under-optimized but
+LLVM seems to handle it well and generates code which looks almost
+exactly like the previous non-generic version. And we have less code
+duplication, so all is good.
+
+\subsection{Porting the GPU code}
+
+For the GPU I'll be a little more conservative: at this point I'm not
+sure how it behaves when we don't use 32bit for register reads and
+writes. For this reason I'll still just support 32bit access by
+checking what kind of generic I'm using:
+
+\begin{lstlisting}
+impl Gpu {
+    //...
+
+    pub fn load<T: Addressable>(&self, offset: u32) -> T {
+
+        if T::width() != AccessWidth::Word {
+            panic!("Unhandled {:?} GPU load", T::width());
+        }
+
+        let r =
+            match offset {
+                0 => self.read(),
+                4 => self.status(),
+                _ => unreachable!(),
+            };
+
+        Addressable::from_u32(r)
+    }
+
+    pub fn store<T: Addressable>(&mut self, offset: u32, val: T) {
+
+        if T::width() != AccessWidth::Word {
+            panic!("Unhandled {:?} GPU load", T::width());
+        }
+
+        let val = val.as_u32();
+
+        match offset {
+            0 => self.gp0(val),
+            4 => self.gp1(val),
+            _ => unreachable!(),
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{Porting the DMA code}
+
+Likewise we only support 32bit access on the DMA registers so we can
+modify the code to reflect that:
+
+\begin{lstlisting}
+impl Interconnect {
+    //...
+
+    /// DMA register read
+    fn dma_reg<T: Addressable>(&self, offset: u32) -> T {
+
+        if T::width() != AccessWidth::Word {
+            panic!("Unhandled {:?} DMA load", T::width());
+        }
+
+        //...
+
+        Addressable::from_u32(res)
+    }
+
+    /// DMA register write
+    fn set_dma_reg<T: Addressable>(&mut self, offset: u32, val: T) {
+        if T::width() != AccessWidth::Word {
+            panic!("Unhandled {:?} DMA store", T::width());
+        }
+
+        let val = val.as_u32();
+
+        //...
+    }
+}
+\end{lstlisting}
+
+Now our code should build and behave exactly like it did before. On my
+system the performance is the performance is the same as far as I can
+tell. This more generic infrastructure will show its usefulness soon
+enough.
 
 \newpage
 
