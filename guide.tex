@@ -10631,7 +10631,7 @@ impl Interconnect {
             return;
         }
 
-        panic!("unhandled store32 into address {:08x}: {:08x}",
+        panic!("unhandled store into address {:08x}: {:08x}",
                addr, val.as_u32());
     }
 }
