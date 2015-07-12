@@ -10764,6 +10764,396 @@ system the performance is the performance is the same as far as I can
 tell. This more generic infrastructure will show its usefulness soon
 enough.
 
+\section{The Debugger: Breakpoints and Watchpoints}
+
+This section is of optional but having a good debugger can save us a
+lot of time later on. Being able to disassemble the code, set
+breakpoints or watchpoints or step through the assembly are invaluable
+tools when we need to understand why some emulated game doesn't behave
+properly in our emulator.
+
+Writing a good debugger frontend can be quite some work however. For
+simplicity's sake I've decided to implement the \href{XXXX}{GDB remote
+  protocol} over a local TCP socket. This way I can just implement the
+low level debugging code in the emulator and I use a general purpose
+GDB binary targeting the MIPS architecture as a frontend. Then I can
+debug Playstation code almost like any program using GDB, I can
+disassemble the code, dump the data etc\dots{}. If I run code that I
+build myself I can even provide it with debugging symbols and step
+through functions and other high level niceties.
+
+You might prefer to design the frontend yourself and integrate it
+directly in the emulator. It's more work but you may add
+Playstation-specific features more easily (GPU debugging comes to
+mind). For this reason I'm just going to describe the low level
+debugging interface in this guide, you'll decide what kind of frontend
+you want to build on top.
+
+\subsection{Debugger memory access}
+
+\label{sec:debug-mem-access}
+
+This part is easy, we already have the generic \code{load} and
+\code{store} functions in our \code{Cpu} that we can use to access the
+memory. We can simply pass a reference to our \code{Cpu} in the
+debugger code and use that directly.
+
+One potential issue with this approach is that loads and stores may
+have unintended side-effects when used from the debugger. For instance
+if we read from the GPUREAD register (when we properly implement it)
+we ``pop'' a word from the read buffer and it'll become unavailable
+when the real Playstation code wants to read it.
+
+Later on when we implement the timings even reading from from regular
+RAM will take a few emulated CPU cycles which will effectively
+``waste'' some time for the emulated code and might result in a missed
+interrupt or something similar.
+
+Fortunately now that we have our generic load and store
+implementations we'll only have to implement a specialized version of
+those two functions if the side-effects become unmanageable in
+debugging code. Those specialized functions could ignore regular
+timings and even call specialized code in the various peripherals to
+prevent any state change.
+
+For the time being I'll just call the regular \code{load} and
+\code{store} functions since we don't emulate enough side-effects to
+make a significant difference anyway. That might change as me become
+more accurate.
+
+\subsection{Breakpoints}
+
+Breakpoints are triggered when a certain instruction gets
+executed. The instruction is identified by its memory address. We can
+store the breakpoint addresses in a vector:
+
+\begin{lstlisting}
+pub struct Debugger {
+    /// Vector containing all active breakpoint addresses
+    breakpoints: Vec<u32>,
+}
+\end{lstlisting}
+
+We then need a pair of function for adding a deleting a
+breakpoint. It's a good idea to make sure we can't insert the same
+address twice: insertions and deletions are going to be rare while the
+address lookup will have to happen for every instruction so we want to
+keep the list as small as possible:
+
+\begin{lstlisting}
+impl Debugger {
+    /// Add a breakpoint that will trigger when the instruction at
+    /// `addr` is about to be executed.
+    fn add_breakpoint(&mut self, addr: u32) {
+        // Make sure we're not adding the same address twice
+        if !self.breakpoints.contains(&addr) {
+            self.breakpoints.push(addr);
+        }
+    }
+
+    /// Delete breakpoint at `addr`. Does nothing if there was no
+    /// breakpoint set for this address.
+    fn del_breakpoint(&mut self, addr: u32) {
+        self.breakpoints.retain(|&a| a != addr);
+    }
+}
+\end{lstlisting}
+
+Finally we can implement the method \code{pc\_change} that will be
+called before every instruction to look for a breakpoint at the
+current address. Needless to say this code is in a very critical path
+and must be as fast as possible:
+
+\begin{lstlisting}
+impl Debugger {
+    //...
+
+    /// Called by the CPU when it's about to execute a new
+    /// instruction. This function is called before *all* CPU
+    /// instructions so it needs to be as fast as possible.
+    pub fn pc_change(&mut self, cpu: &mut Cpu) {
+        if self.breakpoints.contains(&cpu.pc()) {
+            self.debug(cpu);
+        }
+    }
+}
+\end{lstlisting}
+
+The \code{debug} method is where the debugging frontend should be
+notified that the execution stopped and wait for the user to resume
+the execution.
+
+Using a vector to store the breakpoints might seem sub-optimal since
+it has linear lookup time. A tree-based collection could theoritically
+work in logarithmic time. We have to consider two things however: we
+want to optimize for the common case where no debugging is taking
+place and no breakpoint is set and even when we're debugging we
+\emph{probably} won't be using thousands of breakpoints
+simultaneously.
+
+Iterating over an empty vector should be very cheap: a simple test of
+the length of the vector and we exit the loop immediately. And even
+for small non-empty vectors it will probably be faster than a more
+complex structure (strong cache locality, no cache thrashing, no
+indirections, easy prefetching).
+
+For these reasons I don't think it's necessary to bother using
+anything more complicated than a good old vector, the constant cost
+probably matters more than the linear complexity for our usage.
+
+Finally we can plug \code{pc\_change} in our CPU:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Run a single CPU instruction and return
+    pub fn run_next_instruction(&mut self, debugger: &mut Debugger) {
+        // Synchronize the peripherals
+        self.inter.sync(&mut self.tk);
+
+        // Save the address of the current instruction to save in
+        // `EPC` in case of an exception.
+        self.current_pc = self.pc;
+
+        // Debugger entrypoint: used for code breakpoints and stepping
+        debugger.pc_change(self);
+
+        //...
+    }
+
+    pub fn pc(&self) -> u32 {
+        self.pc
+    }
+}
+\end{lstlisting}
+
+I pass the debugger object from the \code{main} function in order to
+be able to start a debugging session at the press of a key:
+
+\begin{lstlisting}
+fn main() {
+    //...
+
+    let mut debugger = Debugger::new();
+
+    let mut event_pump = sdl_context.event_pump();
+
+    loop {
+        for _ in 0..1_000_000 {
+            cpu.run_next_instruction(&mut debugger);
+        }
+
+        // See if we should quit
+        for e in event_pump.poll_iter() {
+            match e {
+                Event::KeyDown { keycode: KeyCode::Pause, .. } =>
+                    debugger.debug(&mut cpu),
+                Event::KeyDown { keycode: KeyCode::Escape, .. } =>
+                    return,
+                Event::Quit {..} => return,
+                _ => (),
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+In a quick benchmark this debugging code causes a small (but
+noticeable) degradation of the performances. I think it'll probably
+end up being well worth it. We could make the compilation of the
+debugging code optional to make it possible to have faster binaries
+when we don't want debugging but we never know when we might need it
+anyway and having several build configurations makes the code harder
+to test and could lead to code rot. The debugger could also
+potentially be used for cheating in games so it might make sense to
+leave it enabled even for ``end user'' builds.
+
+\subsection{Watchpoints}
+
+Being able to break on a specific instruction is useful but sometimes
+we want to know when a certain location in memory is loaded or
+modified. In order to do that we can implement read and write
+watchpoints that will respectively check each load and store address
+and trigger the debugger when a watched address is encountered.
+
+As for breakpoints we'll store the watchpoint addresses in vectors:
+
+\begin{lstlisting}
+pub struct Debugger {
+    /// Vector containing all active read watchpoints
+    read_watchpoints: Vec<u32>,
+    /// Vector containing all active write watchpoints
+    write_watchpoints: Vec<u32>,
+}
+\end{lstlisting}
+
+The methods for adding, removing and testing the watchpoints will
+therefore look very similar to the breakpoint implementation:
+
+\begin{lstlisting}
+impl Debugger {
+    //...
+
+    /// Add a breakpoint that will trigger when the CPU attempts to
+    /// read from `addr`
+    fn add_read_watchpoint(&mut self, addr: u32) {
+        // Make sure we're not adding the same address twice
+        if !self.read_watchpoints.contains(&addr) {
+            self.read_watchpoints.push(addr);
+        }
+    }
+
+    /// Delete read watchpoint at `addr`. Does nothing if there was no
+    /// breakpoint set for this address.
+    fn del_read_watchpoint(&mut self, addr: u32) {
+        self.read_watchpoints.retain(|&a| a != addr);
+    }
+
+    /// Called by the CPU when it's about to load a value from memory.
+    pub fn memory_read(&mut self, cpu: &mut Cpu, addr: u32) {
+        // XXX: how should we handle unaligned watchpoints? For
+        // instance if we have a watchpoint on address 1 and the CPU
+        // executes a `load32 at` address 0, should we break? Also,
+        // should we mask the region?
+        if self.read_watchpoints.contains(&addr) {
+            println!("Read watchpoint triggered at 0x{:08x}", addr);
+            self.debug(cpu);
+        }
+    }
+
+    /// Add a breakpoint that will trigger when the CPU attempts to
+    /// write to `addr`
+    fn add_write_watchpoint(&mut self, addr: u32) {
+        // Make sure we're not adding the same address twice
+        if !self.write_watchpoints.contains(&addr) {
+            self.write_watchpoints.push(addr);
+        }
+    }
+
+    /// Delete write watchpoint at `addr`. Does nothing if there was no
+    /// breakpoint set for this address.
+    fn del_write_watchpoint(&mut self, addr: u32) {
+        self.write_watchpoints.retain(|&a| a != addr);
+    }
+
+    /// Called by the CPU when it's about to load a value from memory.
+    pub fn memory_write(&mut self, cpu: &mut Cpu, addr: u32) {
+        // XXX: same remark as memory_read for unaligned stores
+        if self.write_watchpoints.contains(&addr) {
+            println!("Write watchpoint triggered at 0x{:08x}", addr);
+            self.debug(cpu);
+        }
+    }
+}
+\end{lstlisting}
+
+You can see that I put a few comments about unaligned access and
+regions, I'm not entirely sure what's the right thing to do here. I
+guess we'll see how we want the debugger to behave as we're using it.
+
+Now we just have to plug the memory read and write methods in our
+generic \code{load} and \code{store} functions in the CPU:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Memory read
+    fn load<T: Addressable>(&mut self,
+                            addr: u32,
+                            debugger: &mut Debugger) -> T {
+        debugger.memory_read(self, addr);
+
+        self.inter.load(&mut self.tk, addr)
+    }
+
+    /// Memory write
+    fn store<T: Addressable>(&mut self,
+                             addr: u32,
+                             val: T,
+                             debugger: &mut Debugger) {
+        debugger.memory_write(self, addr);
+
+        if self.sr.cache_isolated() {
+            self.cache_maintenance(addr, val);
+        } else {
+            self.inter.store(&mut self.tk, addr, val);
+        }
+    }
+}
+\end{lstlisting}
+
+We've added an additional \code{debugger} parameter to these two
+methods so we have to pass the debugger reference from
+\code{run\_next\_instruction} to \code{decode\_and\_execute} and
+finally to the various load and store methods that need to do memory
+access (\code{op\_sw}, \code{op\_lw}, \code{op\_swr}, etc\dots{}).
+
+There are two issues with this implementation however. First we
+use this \code{store} method to fetch instructions but we don't want
+to trigger a read watchpoint when we're loading instructions (that's
+what breakpoints are for). The fix is easy, we just call the
+interconnect's load method directly:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Run a single CPU instruction and return
+    pub fn run_next_instruction(&mut self, debugger: &mut Debugger) {
+        //...
+
+        // Fetch instruction at PC
+        let pc = self.current_pc;
+        let instruction = Instruction(self.inter.load(pc));
+
+        //...
+    }
+}
+\end{lstlisting}
+
+An other problem is that you might be using this CPU load method in
+your debugger to read the memory's contents. Obviously you don't want
+to recursively trigger the debugger when you use it to read some
+memory location where a watchpoint happens to live. Instead we can
+create an other method used for loading data for debugging
+purposes\footnote{It can be used as a starting point for a
+  ``side-effect free'' debugging path as I mentioned in
+  section~\ref{sec:debug-mem-access}.}. I named this method
+\code{examine}:
+
+\begin{lstlisting}
+impl Cpu {
+    //...
+
+    /// Debugger memory read
+    pub fn examine<T: Addressable>(&mut self, addr: u32) -> T {
+        self.inter.load(&mut self.tk, addr)
+    }
+}
+\end{lstlisting}
+
+\subsection{Code disassembly and beyond}
+
+I didn't show any disassembler code since GDB does it for me but it
+shouldn't be too difficult to implement since MIPS instructions are
+fixed width. Just read the code you want to disassemble 32bits at a
+time and then implement something similar to our
+\code{decode\_and\_execute} method but instead of executing the
+instruction you return the disassembled code in a string for instance.
+
+If you want to be fancy and support MISP assembler pseudo-instructions
+you'll have to handle certain instructions specifically, for instance
+\mbox{\code{sll \$zero, \$zero, 0}} could be displayed as \code{nop}
+while \mbox{\code{addu \$1, \$2, \$zero}} should be \mbox{\code{move
+    \$1, \$2}}. Of course it's still correct if you keep the real
+instructions instead of the assembler shorthand but it's generally
+more readable if you use the later.
+
+Later on we'll have to consider adding debugging for the GPU as well
+(displaying primitives, textures, exploring linked lists etc\dots{}).
+
 \newpage
 
 \listoftables
