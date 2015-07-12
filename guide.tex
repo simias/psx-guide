@@ -10405,8 +10405,8 @@ impl Addressable for u8 {
         v as u8
     }
 
-    fn as_u32(self) -> u32 {
-        self as u32
+    fn as_u32(&self) -> u32 {
+        *self as u32
     }
 }
 
@@ -10419,8 +10419,8 @@ impl Addressable for u16 {
         v as u16
     }
 
-    fn as_u32(self) -> u32 {
-        self as u32
+    fn as_u32(&self) -> u32 {
+        *self as u32
     }
 }
 
@@ -10433,8 +10433,8 @@ impl Addressable for u32 {
         v
     }
 
-    fn as_u32(self) -> u32 {
-        self
+    fn as_u32(&self) -> u32 {
+        *self
     }
 }
 \end{lstlisting}
@@ -11153,6 +11153,85 @@ more readable if you use the later.
 
 Later on we'll have to consider adding debugging for the GPU as well
 (displaying primitives, textures, exploring linked lists etc\dots{}).
+
+\section{The CPU: Instruction cache}
+
+Before we move on to the GPU timings let's start by implementing the
+CPU instruction cache. Without it we won't be able to emulate the CPU
+speed properly since cached code gets executed much faster than
+instructions that have to be fetched from RAM. The CPU also has a data
+cache but it's not used as a proper cache so we can leave that for
+later.
+
+\subsection{Instruction cache lookup behavior}
+
+The Playstation's CPU has a 4KB instruction cache that can contain up
+to 1024 instructions across 256 4-instruction cachelines. The cache is
+directly mapped which means that there's only one possible cacheline
+for any given memory address.
+
+Here's how it works: each cacheline contains enough room for 4
+instructions plus a tag and valid bits. The tag contains the upper
+20bits of the physical address being cached, it is used to make sure
+we're really getting the data from the correct memory location and not
+some other address that happens to alias the cacheline. Then for each
+instruction in the cacheline a bit says if the entry is valid or
+not. When fetching an instruction if the tag is mismatched or the
+entry is not valid it'll have to be fetched from main memory,
+otherwise we can directly use the cached value.
+
+\begin{table}[ht]
+  \centering
+  \begin{tabular}{ c | c | c | c }
+    Tag [31:12] & Cacheline [11:4] & Index [3:2] & Word alignment [1:0] \\
+    \hline
+    \code{0x80005} & \code{0x38} & \code{1} & 0 \\
+  \end{tabular}
+
+  \caption{Anatomy of cached address 0x80005384}
+  \label{tab:cached-address}
+\end{table}
+
+Let's take a concrete example shown in
+table~\ref{tab:cached-address}. Suppose the CPU wants to run code from
+address \code{0x80005384}. First we need to figure out which cacheline
+matches this address, for that we need to shift the address two bits
+to the right (since we have 4 32bit words per cache line) and then
+take the 8 LSBs (since we have 256 cachelines in total). In this case
+we end up in cacheline number 56 (0x38).
+
+Now that we have identified the cacheline we need to see if it already
+contains data for the current address, after all any address ending in
+\code{0x38X} will match the same cache location. In order to do that
+we compare the tag stored in the line with bits [31:12] of the
+instruction address, in this case \code{0x80005}. If the tag doesn't
+match we consider it invalid and we have to fetch it from RAM.
+
+If the tag is the one we're looking for however we just have to check
+the valid bit for the instruction we're looking for. Bits [3:2] give
+us the location in the 4-word cacheline, bits [1:0] are always 0 since
+all instructions are word-aligned\footnote{Remember that we generate
+  an exception if we ever end up with a misaligned PC so we can always
+  assume that it's correctly aligned after that.} so in this case
+we're looking for the 2nd word in the cacheline. If the valid bit is
+set we can use it directly, otherwise the instruction is invalid and
+we must fetch it from main RAM.
+
+\subsection{Instruction cache fetch behavior}
+
+When an invalid instruction is encountered (either because the line
+has the wrong tag or the valid bit is not set) the Playstation cache
+will will update the tag to match the current address and then fetch
+the missing instruction as well as any \emph{following} instruction in
+the same cacheline, but not the one before it.
+
+For instance in the case of address \code{0x80005384} if we have a
+cache miss the instructions at addresses \code{0x80005384},
+\code{0x80005388} and \code{0x8000538c} will be fetched (words at
+indexes 1, 2 and 3 respectively) but \emph{not} \code{0x80005380} (the
+word at index 0). I suppose that if some of the following instructions
+are already valid they're not fetched again but I haven't tested it
+and it's probably not very common anyway.
 
 \newpage
 
