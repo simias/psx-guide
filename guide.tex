@@ -5906,7 +5906,7 @@ impl Cpu {
             _ => unreachable!(),
         };
 
-        self.store32(addr, mem);
+        self.store32(aligned_addr, mem);
     }
 }
 \end{lstlisting}
@@ -5944,7 +5944,7 @@ impl Cpu {
             _ => unreachable!(),
         };
 
-        self.store32(addr, mem);
+        self.store32(aligned_addr, mem);
     }
 }
 \end{lstlisting}
