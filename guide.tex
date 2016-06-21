@@ -3646,8 +3646,12 @@ and 20 in the instruction:
 \item If bit 16 is set then the instruction is BGEZ, otherwise it's
   BLTZ.
 
-\item If bit 20 is set then the return address is linked in \$ra.
+\item If bits [20:17] are equal to \code{0x80} then the return address
+  is linked in \$ra.
 \end{itemize}
+
+Note that when linking is requested the return address is linked in
+\$ra even if the branch is not taken.
 
 Here's how it can be implemented:
 
@@ -3664,7 +3668,7 @@ impl Cpu {
         let instruction = instruction.0;
 
         let is_bgez = (instruction >> 16) & 1;
-        let is_link = (instruction >> 20) & 1 != 0;
+        let is_link = (instruction >> 17) & 0xf == 8;
 
         let v = self.reg(s) as i32;
 
@@ -3676,14 +3680,14 @@ impl Cpu {
         // ("a >= 0" <=> "!(a < 0)"). The xor takes care of that.
         let test = test ^ is_bgez;
 
+        if is_link {
+            let ra = self.pc;
+
+            // Store return address in R31
+            self.set_reg(RegisterIndex(31), ra);
+        }
+
         if test != 0 {
-            if is_link {
-                let ra = self.pc;
-
-                // Store return address in R31
-                self.set_reg(RegisterIndex(31), ra);
-            }
-
             self.branch(i);
         }
     }
