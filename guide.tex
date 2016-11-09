@@ -1114,7 +1114,10 @@ I've also added a getter and a setter. They're very straightforward
 but I take care to always write 0 in \$zero in case it gets
 overwritten. I don't ever bother checking if the function wrote in
 this register or an other one, writing a 32bit value is cheap and
-probably cheaper than adding an \code{if}.
+probably cheaper than adding an \code{if}. It's also important to
+note that the BIOS does try to write to \$zero, it is believed that
+this is useful to discard an I/O result without having to waste a
+register.
 
 \subsection{LUI instruction}
 
@@ -7181,7 +7184,9 @@ impl Channel {
 Note the conditional to write \code{0xffffff} in the last iteration,
 it's of course important because otherwise the DMA won't find the end
 of table marker and start jumping randomly in RAM, sending crap to the
-GPU in the process.
+GPU in the process. It's important to note that this is vital, and even
+the "Sony Logo" won't render correctly if this is not implemented, if
+you're not receiving \code{GP0(38h)}, this is probably why.
 
 When the copy is done I call the \code{channel.done()} method which
 clears the \code{trigger} and \code{enable} flags. It should probably
