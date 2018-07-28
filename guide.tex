@@ -137,7 +137,7 @@ that pesky hardware in person!
 
 Since this is supposed to be a general guide about writing PlayStation
 emulators I won't put the entire source code of the emulator here,
-only snippets relevant to the matter beind discussed.
+only snippets relevant to the matter being discussed.
 
 Finally, keep in mind that getting a PlayStation emulator even capable
 to run \emph{some} games decently will require quite a lot of work. Don't
@@ -160,7 +160,7 @@ Ready? Let's begin!
 
 That might seem like a silly question to some but I'm sure there are
 plenty of competent programmers out there who are used to program in
-high level managed environements haven't seen a register in their
+high level managed environments haven't seen a register in their
 entire life. Let me make the introductions.
 
 For our first version of the PlayStation CPU I'm going to make some
@@ -194,7 +194,7 @@ can address 4GB of memory. That's why the PlayStation is said to be a
 32bit console (that and the fact that it uses 32bit registers in the
 CPU as we'll see in a minute).
 
-This address space contains all the external ressources the CPU can
+This address space contains all the external resources the CPU can
 access: the RAM of course but also the various peripherals (GPU,
 controllers, CD drive, BIOS...). That's called
 \href{https://en.wikipedia.org/wiki/Memory-mapped_I/O}{memory mapped
@@ -230,7 +230,7 @@ multiplying them, masking them, storing their content to memory or
 fetching it back\dots{}
 
 \href{https://en.wikipedia.org/wiki/Program_counter}{The Program
-  Counter} (henceforth refered to as PC) is one of the most
+  Counter} (henceforth referred to as PC) is one of the most
 elementary registers, it exists in one form or an other on basically
 all computer architectures (although it goes by various names, on x86
 for instance it's called the Instruction Pointer, IP). Its
@@ -342,7 +342,7 @@ it should start running the code. It basically defines the location of
 the "main" function of the console's kernel.
 
 The docs say that the reset value of PC is
-\code{0xbfc00000}. In the playstation memory map that's the
+\code{0xbfc00000}. In the Playstation memory map that's the
 beginning of the BIOS (we'll look at the memory map in greater details
 in the next section).
 
@@ -589,10 +589,10 @@ consecutive bytes. We can store [0x12, 0x34, 0x56, 0x78] or
 first. The latter is \emph{little-endian} because we store the least
 significant byte first. There are other endian types with weirder
 patterns but they're not often used is modern computers. Check
-wikipedia if you want more details.
+Wikipedia if you want more details.
 
 The PlayStation is little-endian so we're in the 2nd case: when
-reading or writing multi-byte values the least significiant byte goes
+reading or writing multi-byte values the least significant byte goes
 first. If we do it the other way around we'll end up with garbage.
 
 Now we can implement our interconnect to let the CPU communicate with
@@ -622,7 +622,7 @@ is that memory transactions are very common (several millions per
 second potentially) and having to send data and resynchronize across
 threads would kill our performances.
 
-Multihreading emulators in general is a very tough issue: for
+Multithreading emulators in general is a very tough issue: for
 threading to be really efficient you need to reduce data exchange and
 resynchronization as much as possible to let each thread live its
 life. When we emulate however we want to mimick the original hardware
@@ -832,7 +832,7 @@ processor. Once again the
 \href{http://problemkaputt.de/psx-spx.htm#cpuspecifications}{Nocash
   specs} have our back and list the format of the
 instruction. \href{https://en.wikipedia.org/wiki/MIPS_instruction_set}{MIPS}
-is a common architecture used outside of the playstation and you can
+is a common architecture used outside of the Playstation and you can
 find plenty of resources online describing its \href{https://en.wikipedia.org/wiki/Instruction_set}{instruction set}.
 
 Let's decode this one by hand to see how this works. If we look at the
@@ -1810,7 +1810,7 @@ MIPS however doesn't do that. It doesn't bother wasting time flushing
 the pipeline, it just ignore the issues and run the code anyway. What
 this means is that the first instruction right \emph{after} a branch
 always gets executed \emph{before} the branch is taken,
-\emph{unconditionaly}. This instruction is said to be in the
+\emph{unconditionally}. This instruction is said to be in the
 \href{https://en.wikipedia.org/wiki/Delay_slot}{branch delay slot}
 
 Consider the following assembly\footnote{I'm assuming that
@@ -1882,7 +1882,7 @@ And now our jumps should behave correctly.
 
 After the jump there's a sequence of LUI/ORI/SW used to store a bunch
 of values in the \code{SYS\_CONTROL} registers that we chose to
-ignore. We then stumbble upon a new instruction: \code{0x00000825}
+ignore. We then stumble upon a new instruction: \code{0x00000825}
 which encodes a \emph{bitwise or} operation:
 
 \begin{lstlisting}[language=assembly]
@@ -2006,7 +2006,7 @@ The MIPS R3000 CPU can support up to 4 coprocessors:
 \item The coprocessor 1 (cop1) is optional: when available it's used for
   floating point arithmetic. You might expect that a videogame console
   would benefit greatly from having hardware accelerated floating point
-  and yet cop1 is not implemented on the playstation! Instead we have
+  and yet cop1 is not implemented on the Playstation! Instead we have
   the coprocessor 2.
 
 \item The coprocessor 2 (cop2) is, as far as I know, custom made for
@@ -2066,7 +2066,7 @@ registers) and the target register (one of the coprocessor's
 register). Those parameters are respectively in bits [20:16] and
 [15:11] of the instruction.
 
-In our current instruciton both of those parameters are equal to 12 so
+In our current instruction both of those parameters are equal to 12 so
 if we decode the instruction in full it gives\footnote{This is
   actually pseudo-assembly for the sake of clarity. The correct GNU
   assembler syntax would be \mbox{\code{mtc0 \$12, \$12}} but it's a
@@ -2523,7 +2523,7 @@ impl Cpu {
 \label{sec:ram}
 
 Unfortunately we can't test our brand new load delay slot just yet
-because the current instruction attemps to load from an unhandled
+because the current instruction attempts to load from an unhandled
 address: \code{0xa0000000}. The memory map\ref{tab:mmap} tells us that
 this is the first address in RAM.
 
@@ -2774,8 +2774,8 @@ be able to make some simplifications:
 
 \item The Playstation CPU has 1KB of data cache and an other kilobyte
   of instruction cache. However the data cache is not used, instead
-  its memory is mapped as the "scratpad" at a fixed location. In other
-  word we don't need to implement the data cache.
+  its memory is mapped as the "scratchpad" at a fixed location. In
+  other word we don't need to implement the data cache.
 
 \item As far as I can tell the Playstation software doesn't seem to
   use the kernel/user privilege separation and runs everything in
@@ -4528,7 +4528,7 @@ by checking bits [31:26] which are \code{0b010000} and introduce a
 coprocessor opcode. Then we check bits [25:21] to figure which one it
 is. For RFE it's \code{0b10000}.
 
-But it's not over! There can be multiple instructionts with this
+But it's not over! There can be multiple instructions with this
 coprocessor encoding, although RFE is the only one implemented on the
 Playstation hardware (the others have to do with virtual memory). To
 make sure the requested instruction is the one we expect we must check
@@ -4571,7 +4571,7 @@ impl Cpu {
 
 In our current implementation when an exception occurs we store the
 current instruction's address in `EPC`. That's correct in most cases
-but there's one exception in the MIPS archicture: when an exception
+but there's one exception in the MIPS architecture: when an exception
 occurs in a branch delay slot we must store the address of the
 \emph{branch} instruction in EPC\footnote{ This is only for
   \emph{branch} delay slots, \emph{load} delay slots behave normally
@@ -4601,7 +4601,7 @@ new variables:
 pub struct Cpu {
     //...
 
-    /// Set by the current instruction if a branch occured and the
+    /// Set by the current instruction if a branch occurred and the
     /// next instruction will be in the delay slot.
     branch: bool,
     /// Set if the current instruction executes in the delay slot
@@ -4951,7 +4951,7 @@ lhu $25, 430($16)
 \end{lstlisting}
 
 It's the 16bit counterpart to LBU and it's our first 16bit load
-istruction:
+instruction:
 
 \begin{lstlisting}
 impl Cpu {
@@ -10456,13 +10456,13 @@ this:
 
 \begin{lstlisting}
 impl Cpu {
-    //...    
+    //...
 
     /// Memory read
     fn load<T: Addressable>(&self, addr: u32) -> T {
         self.inter.load(addr)
     }
-    
+
     /// Memory write
     fn store<T: Addressable>(&mut self, addr: u32, val: T) {
         if self.sr & 0x10000 != 0 {
@@ -10485,7 +10485,7 @@ have to explicitly tell it which of \code{u8}, \code{u16} or
 
 \begin{lstlisting}
 impl Cpu {
-    //...    
+    //...
 
     /// Load Byte (signed)
     fn op_lb(&mut self,
