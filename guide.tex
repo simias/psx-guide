@@ -1807,7 +1807,7 @@ expensive (and why I always overwrite \code{regs[0]} in
 \code{set\_reg} instead of checking if the register was 0).
 
 MIPS however doesn't do that. It doesn't bother wasting time flushing
-the pipeline, it just ignore the issues and run the code anyway. What
+the pipeline, it just ignores the issues and runs the code anyway. What
 this means is that the first instruction right \emph{after} a branch
 always gets executed \emph{before} the branch is taken,
 \emph{unconditionaly}. This instruction is said to be in the
