@@ -310,7 +310,7 @@ piece of code:
 
 \begin{itemize}
  \item What's the initial value of PC when starting up?
- \item How do we implement the \code{fetch32} function?
+ \item How do we implement the \code{load32} function?
  \item How do we implement the \code{decode\_and\_execute} function?
 \end{itemize}
 
@@ -714,7 +714,7 @@ impl Interconnect {
             return self.bios.load32(offset);
         }
 
-        panic!("unhandled fetch32 at address {:08x}", addr);
+        panic!("unhandled load32 at address {:08x}", addr);
     }
 }
 \end{lstlisting}
